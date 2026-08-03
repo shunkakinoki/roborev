@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -204,6 +205,32 @@ func TestServerStartRejectsNonLoopbackBindAddr(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestServerStartRejectsAccessDeniedExistingDaemon(t *testing.T) {
+	testenv.SetDataDir(t)
+	require.NoError(t, WriteRuntime(
+		DaemonEndpoint{Network: "tcp", Address: defaultTestAddr},
+		nil,
+		"test-version",
+	))
+
+	origProbe := probeRuntimeEndpoint
+	probeRuntimeEndpoint = func(context.Context, DaemonEndpoint) (*PingInfo, error) {
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: syscall.EACCES}
+	}
+	t.Cleanup(func() { probeRuntimeEndpoint = origProbe })
+
+	db, _ := testutil.OpenTestDBWithDir(t)
+	cfg := config.DefaultConfig()
+	cfg.ServerAddr = "127.0.0.1:0"
+	server := NewServer(db, cfg, "")
+	t.Cleanup(func() { require.NoError(t, server.Close()) })
+
+	err := server.Start(t.Context())
+	require.ErrorIs(t, err, ErrDaemonAccessDenied)
+	assert.FileExists(t, RuntimePath())
+	assert.Empty(t, server.endpoint.Address)
 }
 
 func TestWaitForServerReadySurfacesServeError(t *testing.T) {

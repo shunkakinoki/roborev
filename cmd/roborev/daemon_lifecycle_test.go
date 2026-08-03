@@ -2,10 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -179,4 +181,101 @@ func TestEnsureDaemonCleansZombiesBeforeColdStart(t *testing.T) {
 
 	require.NoError(t, ensureDaemon())
 	assert.Equal(t, []string{"cleanup:127.0.0.1:1", "start"}, calls)
+}
+
+func TestEnsureDaemonDoesNotRecoverFromAccessDeniedDiscovery(t *testing.T) {
+	t.Setenv("ROBOREV_SKIP_VERSION_CHECK", "")
+
+	origGet := getAnyRunningDaemon
+	origProbe := probeDaemonForEnsure
+	origCleanup := cleanupZombieDaemons
+	origRestart := restartDaemonForEnsure
+	origStart := startDaemonForEnsure
+	getAnyRunningDaemon = func() (*daemon.RuntimeInfo, error) {
+		return nil, daemon.ErrDaemonAccessDenied
+	}
+	probeCalls, cleanupCalls, restartCalls, startCalls := 0, 0, 0, 0
+	probeDaemonForEnsure = func(daemon.DaemonEndpoint, time.Duration) (*daemon.PingInfo, error) {
+		probeCalls++
+		return nil, nil
+	}
+	cleanupZombieDaemons = func(daemon.DaemonEndpoint) int { cleanupCalls++; return 0 }
+	restartDaemonForEnsure = func() error { restartCalls++; return nil }
+	startDaemonForEnsure = func() error { startCalls++; return nil }
+	t.Cleanup(func() {
+		getAnyRunningDaemon = origGet
+		probeDaemonForEnsure = origProbe
+		cleanupZombieDaemons = origCleanup
+		restartDaemonForEnsure = origRestart
+		startDaemonForEnsure = origStart
+	})
+
+	err := ensureDaemon()
+	require.ErrorIs(t, err, daemon.ErrDaemonAccessDenied)
+	assert.Zero(t, probeCalls)
+	assert.Zero(t, cleanupCalls)
+	assert.Zero(t, restartCalls)
+	assert.Zero(t, startCalls)
+}
+
+func TestEnsureDaemonDoesNotRestartAfterAccessDeniedVersionProbe(t *testing.T) {
+	t.Setenv("ROBOREV_SKIP_VERSION_CHECK", "")
+
+	origGet := getAnyRunningDaemon
+	origProbe := probeDaemonForEnsure
+	origRestart := restartDaemonForEnsure
+	origStart := startDaemonForEnsure
+	getAnyRunningDaemon = func() (*daemon.RuntimeInfo, error) {
+		return &daemon.RuntimeInfo{Network: "tcp", Address: "127.0.0.1:7373"}, nil
+	}
+	probeDaemonForEnsure = func(daemon.DaemonEndpoint, time.Duration) (*daemon.PingInfo, error) {
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: syscall.EPERM}
+	}
+	restartCalls, startCalls := 0, 0
+	restartDaemonForEnsure = func() error { restartCalls++; return nil }
+	startDaemonForEnsure = func() error { startCalls++; return nil }
+	t.Cleanup(func() {
+		getAnyRunningDaemon = origGet
+		probeDaemonForEnsure = origProbe
+		restartDaemonForEnsure = origRestart
+		startDaemonForEnsure = origStart
+	})
+
+	err := ensureDaemon()
+	require.ErrorIs(t, err, daemon.ErrDaemonAccessDenied)
+	assert.Zero(t, restartCalls)
+	assert.Zero(t, startCalls)
+}
+
+func TestEnsureDaemonDoesNotColdStartAfterAccessDeniedDefaultProbe(t *testing.T) {
+	t.Setenv("ROBOREV_SKIP_VERSION_CHECK", "")
+
+	origServerAddr := serverAddr
+	origParsed := parsedServerEndpoint
+	origGet := getAnyRunningDaemon
+	origProbe := probeDaemonForEnsure
+	origCleanup := cleanupZombieDaemons
+	origStart := startDaemonForEnsure
+	serverAddr = ""
+	parsedServerEndpoint = nil
+	getAnyRunningDaemon = func() (*daemon.RuntimeInfo, error) { return nil, os.ErrNotExist }
+	probeDaemonForEnsure = func(daemon.DaemonEndpoint, time.Duration) (*daemon.PingInfo, error) {
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: syscall.EACCES}
+	}
+	cleanupCalls, startCalls := 0, 0
+	cleanupZombieDaemons = func(daemon.DaemonEndpoint) int { cleanupCalls++; return 0 }
+	startDaemonForEnsure = func() error { startCalls++; return nil }
+	t.Cleanup(func() {
+		serverAddr = origServerAddr
+		parsedServerEndpoint = origParsed
+		getAnyRunningDaemon = origGet
+		probeDaemonForEnsure = origProbe
+		cleanupZombieDaemons = origCleanup
+		startDaemonForEnsure = origStart
+	})
+
+	err := ensureDaemon()
+	require.ErrorIs(t, err, daemon.ErrDaemonAccessDenied)
+	assert.Zero(t, cleanupCalls)
+	assert.Zero(t, startCalls)
 }

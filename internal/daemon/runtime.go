@@ -28,6 +28,8 @@ const (
 // prevented every usable endpoint from being probed.
 var ErrDaemonAccessDenied = errors.New("daemon access denied")
 
+var probeRuntimeEndpoint = probeRuntimeRecord
+
 // RuntimeInfo stores daemon runtime state
 type RuntimeInfo struct {
 	PID              int    `json:"pid"`
@@ -288,8 +290,11 @@ func probeRuntimeRecord(ctx context.Context, ep DaemonEndpoint) (*PingInfo, erro
 	return pingInfoFromKit(info), nil
 }
 
-func isDaemonAccessDenied(err error) bool {
-	return errors.Is(err, os.ErrPermission) ||
+// IsDaemonAccessDenied reports whether err is roborev's access-denied sentinel
+// or an operating-system permission error from a local endpoint probe.
+func IsDaemonAccessDenied(err error) bool {
+	return errors.Is(err, ErrDaemonAccessDenied) ||
+		errors.Is(err, os.ErrPermission) ||
 		errors.Is(err, syscall.EACCES) ||
 		errors.Is(err, syscall.EPERM)
 }
@@ -317,7 +322,7 @@ func discoverRuntimeRecords(
 				}
 				return info, nil
 			}
-			if isDaemonAccessDenied(err) {
+			if IsDaemonAccessDenied(err) {
 				deniedErr = fmt.Errorf("%w at %s: %w", ErrDaemonAccessDenied, ep, err)
 			}
 		}
@@ -335,7 +340,7 @@ func GetAnyRunningDaemon() (*RuntimeInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	return discoverRuntimeRecords(context.Background(), records, probeRuntimeRecord)
+	return discoverRuntimeRecords(context.Background(), records, probeRuntimeEndpoint)
 }
 
 // ProbeDaemon validates that a daemon endpoint is serving the roborev daemon.
@@ -356,25 +361,49 @@ func ProbeDaemon(ep DaemonEndpoint, timeout time.Duration) (*PingInfo, error) {
 	return pingInfoFromKit(info), nil
 }
 
-// IsDaemonAlive checks if a daemon at the given endpoint is actually responding.
+// ProbeDaemonAlive checks if a daemon at the given endpoint is actually responding.
 // This is more reliable than checking PID and works cross-platform.
 // Only allows loopback addresses (for TCP) to prevent SSRF via malicious runtime files.
 // Uses retry logic to avoid misclassifying a slow or transiently failing daemon.
-func IsDaemonAlive(ep DaemonEndpoint) bool {
+func ProbeDaemonAlive(ep DaemonEndpoint) (bool, error) {
 	if ep.Address == "" {
-		return false
+		return false, nil
 	}
 
-	// Try up to 2 times with a short delay between attempts
+	var lastErr error
 	for attempt := range 2 {
 		if attempt > 0 {
 			time.Sleep(200 * time.Millisecond)
 		}
-		if _, err := ProbeDaemon(ep, 1*time.Second); err == nil {
-			return true
+		if _, err := probeRuntimeEndpoint(context.Background(), ep); err == nil {
+			return true, nil
+		} else if IsDaemonAccessDenied(err) {
+			return false, fmt.Errorf("%w at %s: %w", ErrDaemonAccessDenied, ep, err)
+		} else {
+			lastErr = err
 		}
 	}
-	return false
+	return false, lastErr
+}
+
+// IsDaemonAlive checks if a daemon at the given endpoint is actually responding.
+func IsDaemonAlive(ep DaemonEndpoint) bool {
+	alive, _ := ProbeDaemonAlive(ep)
+	return alive
+}
+
+func probeRuntimeAlive(info *RuntimeInfo) (bool, error) {
+	var deniedErr error
+	for _, ep := range info.Endpoints() {
+		alive, err := ProbeDaemonAlive(ep)
+		if alive {
+			return true, nil
+		}
+		if IsDaemonAccessDenied(err) {
+			deniedErr = err
+		}
+	}
+	return false, deniedErr
 }
 
 func parseDaemonBindAddr(addr string) (string, int, error) {
@@ -523,8 +552,11 @@ func CleanupZombieDaemons(target DaemonEndpoint) int {
 			continue
 		}
 
-		// Skip responsive daemons
-		if IsDaemonAlive(ep) {
+		alive, probeErr := probeRuntimeAlive(info)
+		if alive {
+			continue
+		}
+		if IsDaemonAccessDenied(probeErr) {
 			continue
 		}
 

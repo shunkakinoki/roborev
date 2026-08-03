@@ -599,6 +599,32 @@ func TestDiscoverRuntimeRecords(t *testing.T) {
 	})
 }
 
+func TestCleanupZombieDaemonsPreservesAccessDeniedRuntime(t *testing.T) {
+	testenv.SetDataDir(t)
+	socketDir, err := os.MkdirTemp("/tmp", "rr-denied-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(socketDir)) })
+	socketPath := filepath.Join(socketDir, "daemon.sock")
+	require.NoError(t, os.WriteFile(socketPath, nil, 0o600))
+
+	primary := DaemonEndpoint{Network: "tcp", Address: defaultTestAddr}
+	alternate := DaemonEndpoint{Network: "unix", Address: socketPath}
+	require.NoError(t, WriteRuntime(primary, &alternate, "test-version"))
+	runtimePath := RuntimePath()
+
+	origProbe := probeRuntimeEndpoint
+	probeRuntimeEndpoint = func(context.Context, DaemonEndpoint) (*PingInfo, error) {
+		return nil, &net.OpError{Op: "dial", Net: "local", Err: syscall.EPERM}
+	}
+	t.Cleanup(func() { probeRuntimeEndpoint = origProbe })
+
+	cleaned := CleanupZombieDaemons(primary)
+
+	assert.Zero(t, cleaned)
+	assert.FileExists(t, runtimePath)
+	assert.FileExists(t, socketPath)
+}
+
 func TestListAllRuntimesWithGlobMetacharacters(t *testing.T) {
 	// Create a temp directory with glob metacharacters in the name
 	tmpDir := t.TempDir()

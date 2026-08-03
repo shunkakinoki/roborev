@@ -179,8 +179,15 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}
 
-	// Check if a responsive daemon is still running after cleanup
-	if info, err := GetAnyRunningDaemon(); err == nil && IsDaemonAlive(info.Endpoint()) {
+	// Check if a responsive daemon is still running after cleanup.
+	info, discoveryErr := GetAnyRunningDaemon()
+	if IsDaemonAccessDenied(discoveryErr) {
+		if listener != nil {
+			_ = listener.Close()
+		}
+		return discoveryErr
+	}
+	if discoveryErr == nil && IsDaemonAlive(info.Endpoint()) {
 		if listener != nil {
 			_ = listener.Close()
 		}

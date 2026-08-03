@@ -41,6 +41,7 @@ var (
 	// daemon may be mid-startup or briefly too busy to answer.
 	ensureProbeAttempts   = 3
 	ensureProbeRetryDelay = 1 * time.Second
+	probeDaemonForEnsure  = probeDaemonWithRetry
 
 	// daemonStartTimeout bounds how long startDaemon waits for a spawned
 	// daemon to become ready.
@@ -226,10 +227,17 @@ func ensureDaemon() error {
 	skipVersionCheck := os.Getenv("ROBOREV_SKIP_VERSION_CHECK") == "1"
 
 	// First check runtime files for any running daemon
-	if info, err := getAnyRunningDaemon(); err == nil {
+	info, discoveryErr := getAnyRunningDaemon()
+	if daemon.IsDaemonAccessDenied(discoveryErr) {
+		return discoveryErr
+	}
+	if discoveryErr == nil {
 		if !skipVersionCheck {
-			probe, err := probeDaemonWithRetry(info.Endpoint(), 2*time.Second)
+			probe, err := probeDaemonForEnsure(info.Endpoint(), 2*time.Second)
 			if err != nil {
+				if daemon.IsDaemonAccessDenied(err) {
+					return fmt.Errorf("%w: %w", daemon.ErrDaemonAccessDenied, err)
+				}
 				if verbose {
 					fmt.Printf("Daemon probe failed, restarting...\n")
 				}
@@ -256,7 +264,8 @@ func ensureDaemon() error {
 	// Try the configured default address for manual daemon runs that do not
 	// have a runtime file yet.
 	ep := getDaemonEndpoint()
-	if probe, err := daemon.ProbeDaemon(ep, 2*time.Second); err == nil {
+	probe, probeErr := probeDaemonForEnsure(ep, 2*time.Second)
+	if probeErr == nil {
 		if !skipVersionCheck {
 			if probe.Version == "" {
 				if verbose {
@@ -272,6 +281,9 @@ func ensureDaemon() error {
 			}
 		}
 		return nil
+	}
+	if daemon.IsDaemonAccessDenied(probeErr) {
+		return fmt.Errorf("%w: %w", daemon.ErrDaemonAccessDenied, probeErr)
 	}
 
 	// Legacy pre-kit daemons are invisible to kit discovery because they do
