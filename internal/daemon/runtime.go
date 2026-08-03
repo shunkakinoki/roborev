@@ -3,12 +3,14 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	kitdaemon "go.kenn.io/kit/daemon"
@@ -16,16 +18,26 @@ import (
 	"go.kenn.io/roborev/internal/config"
 )
 
-const daemonServiceName = "roborev"
+const (
+	daemonServiceName          = "roborev"
+	runtimeAlternateNetworkKey = "alternate_network"
+	runtimeAlternateAddressKey = "alternate_address"
+)
+
+// ErrDaemonAccessDenied means a daemon runtime was found but local permissions
+// prevented every usable endpoint from being probed.
+var ErrDaemonAccessDenied = errors.New("daemon access denied")
 
 // RuntimeInfo stores daemon runtime state
 type RuntimeInfo struct {
-	PID        int    `json:"pid"`
-	Network    string `json:"network,omitempty"`
-	Address    string `json:"address"`
-	Service    string `json:"service,omitempty"`
-	Version    string `json:"version,omitempty"`
-	SourcePath string `json:"-"` // Path to the runtime file (not serialized, set by ListAllRuntimes)
+	PID              int    `json:"pid"`
+	Network          string `json:"network,omitempty"`
+	Address          string `json:"address"`
+	Service          string `json:"service,omitempty"`
+	Version          string `json:"version,omitempty"`
+	SourcePath       string `json:"-"` // Path to the runtime file (not serialized, set by ListAllRuntimes)
+	AlternateNetwork string `json:"-"`
+	AlternateAddress string `json:"-"`
 }
 
 // Endpoint returns a DaemonEndpoint for this runtime.
@@ -37,6 +49,31 @@ func (r RuntimeInfo) Endpoint() DaemonEndpoint {
 		Service: r.Service,
 		Version: r.Version,
 	}.Endpoint())
+}
+
+// Endpoints returns the primary endpoint followed by a valid distinct
+// alternate endpoint published in runtime metadata.
+func (r RuntimeInfo) Endpoints() []DaemonEndpoint {
+	primary := r.Endpoint()
+	endpoints := []DaemonEndpoint{primary}
+	if r.AlternateNetwork == "" || r.AlternateAddress == "" {
+		return endpoints
+	}
+
+	var raw string
+	switch r.AlternateNetwork {
+	case "tcp":
+		raw = r.AlternateAddress
+	case "unix":
+		raw = "unix://" + r.AlternateAddress
+	default:
+		return endpoints
+	}
+	alternate, err := ParseEndpoint(raw)
+	if err != nil || alternate == primary {
+		return endpoints
+	}
+	return append(endpoints, alternate)
 }
 
 // PingInfo is the minimal daemon identity payload used for liveness probes.
@@ -73,12 +110,14 @@ func DiscoverOptions(timeout time.Duration) kitdaemon.DiscoverOptions {
 func runtimeInfoFromRecord(rec kitdaemon.RuntimeRecord) *RuntimeInfo {
 	ep := daemonEndpointFromKit(rec.Endpoint())
 	return &RuntimeInfo{
-		PID:        rec.PID,
-		Network:    ep.Network,
-		Address:    ep.Address,
-		Service:    rec.Service,
-		Version:    rec.Version,
-		SourcePath: rec.SourcePath,
+		PID:              rec.PID,
+		Network:          ep.Network,
+		Address:          ep.Address,
+		Service:          rec.Service,
+		Version:          rec.Version,
+		SourcePath:       rec.SourcePath,
+		AlternateNetwork: rec.Metadata[runtimeAlternateNetworkKey],
+		AlternateAddress: rec.Metadata[runtimeAlternateAddressKey],
 	}
 }
 
@@ -107,8 +146,22 @@ func RuntimePathForPID(pid int) string {
 
 // WriteRuntime saves the daemon runtime info atomically.
 // Uses write-to-temp-then-rename to prevent readers from seeing partial writes.
-func WriteRuntime(ep DaemonEndpoint, version string) error {
-	rec := kitdaemon.NewRuntimeRecord(daemonServiceName, version, ep.kitEndpoint())
+func WriteRuntime(primary DaemonEndpoint, alternate *DaemonEndpoint, version string) error {
+	rec := kitdaemon.NewRuntimeRecord(daemonServiceName, version, primary.kitEndpoint())
+	if alternate != nil {
+		info := RuntimeInfo{
+			Network:          primary.Network,
+			Address:          primary.Address,
+			AlternateNetwork: alternate.Network,
+			AlternateAddress: alternate.Address,
+		}
+		if len(info.Endpoints()) == 2 {
+			rec.Metadata = map[string]string{
+				runtimeAlternateNetworkKey: alternate.Network,
+				runtimeAlternateAddressKey: alternate.Address,
+			}
+		}
+	}
 	_, err := runtimeStore().Write(rec)
 	return err
 }
@@ -218,23 +271,71 @@ func listLegacyRuntimes() []*RuntimeInfo {
 	return runtimes
 }
 
-// GetAnyRunningDaemon returns info about a responsive daemon.
-// Returns os.ErrNotExist if no responsive daemon is found.
-func GetAnyRunningDaemon() (*RuntimeInfo, error) {
-	rec, _, ok, err := kitdaemon.Discover(context.Background(), runtimeStore(), kitdaemon.DiscoverOptions{
-		Probe: kitdaemon.ProbeOptions{
-			ExpectedService: daemonServiceName,
-			Timeout:         time.Second,
-		},
+func probeRuntimeRecord(ctx context.Context, ep DaemonEndpoint) (*PingInfo, error) {
+	if ep.Address == "" {
+		return nil, fmt.Errorf("empty daemon address")
+	}
+	if !ep.IsUnix() && !isLoopbackAddr(ep.Address) {
+		return nil, fmt.Errorf("non-loopback daemon address: %s", ep.Address)
+	}
+	info, err := kitdaemon.Probe(ctx, ep.kitEndpoint(), kitdaemon.ProbeOptions{
+		ExpectedService: daemonServiceName,
+		Timeout:         time.Second,
 	})
 	if err != nil {
 		return nil, err
 	}
-	if ok {
-		return runtimeInfoFromRecord(rec), nil
-	}
+	return pingInfoFromKit(info), nil
+}
 
+func isDaemonAccessDenied(err error) bool {
+	return errors.Is(err, os.ErrPermission) ||
+		errors.Is(err, syscall.EACCES) ||
+		errors.Is(err, syscall.EPERM)
+}
+
+func discoverRuntimeRecords(
+	ctx context.Context,
+	records []kitdaemon.RuntimeRecord,
+	probe func(context.Context, DaemonEndpoint) (*PingInfo, error),
+) (*RuntimeInfo, error) {
+	var deniedErr error
+	for _, rec := range records {
+		info := runtimeInfoFromRecord(rec)
+		primary := info.Endpoint()
+		for _, ep := range info.Endpoints() {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			_, err := probe(ctx, ep)
+			if err == nil {
+				info.Network = ep.Network
+				info.Address = ep.Address
+				if ep != primary {
+					info.AlternateNetwork = primary.Network
+					info.AlternateAddress = primary.Address
+				}
+				return info, nil
+			}
+			if isDaemonAccessDenied(err) {
+				deniedErr = fmt.Errorf("%w at %s: %w", ErrDaemonAccessDenied, ep, err)
+			}
+		}
+	}
+	if deniedErr != nil {
+		return nil, deniedErr
+	}
 	return nil, os.ErrNotExist
+}
+
+// GetAnyRunningDaemon returns info about a responsive daemon.
+// Returns os.ErrNotExist if no responsive daemon is found.
+func GetAnyRunningDaemon() (*RuntimeInfo, error) {
+	records, err := runtimeStore().List()
+	if err != nil {
+		return nil, err
+	}
+	return discoverRuntimeRecords(context.Background(), records, probeRuntimeRecord)
 }
 
 // ProbeDaemon validates that a daemon endpoint is serving the roborev daemon.

@@ -284,7 +284,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.startPanelSweep(ctx)
 
 	// Write runtime info only after the HTTP server is accepting requests.
-	if err := WriteRuntime(ep, version.Version); err != nil {
+	if err := WriteRuntime(ep, nil, version.Version); err != nil {
 		log.Printf("Warning: failed to write runtime info: %v", err)
 	}
 
