@@ -52,6 +52,10 @@ func skillDerivations() []skillDerivation {
 				},
 				{Old: "$roborev", New: "/roborev"},
 				{Old: "CLAUDE.md", New: "AGENTS.md"},
+				{
+					Old: "`sandbox_permissions: \"require_escalated\"`",
+					New: "the runtime's supported sandbox escalation mechanism",
+				},
 			},
 		})
 	}
@@ -62,6 +66,11 @@ func skillDerivations() []skillDerivation {
 				New: ", or structured\nClaude Code skill selection",
 			},
 			{Old: "$roborev", New: "/roborev"},
+			{Old: "Retry the same command with", New: "Retry the same Bash command with"},
+			{
+				Old: "`sandbox_permissions: \"require_escalated\"`",
+				New: "`dangerouslyDisableSandbox: true`",
+			},
 		}
 		// roborev-fix must stay model-invocable: the agent-hook Stop hook
 		// instructs the Claude Code model to invoke it, and
