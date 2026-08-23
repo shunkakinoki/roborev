@@ -78,11 +78,12 @@ type ReviewJob struct {
 	Provider          string     `json:"provider,omitempty"`           // Effective provider for this run (e.g., anthropic, openai)
 	RequestedModel    string     `json:"requested_model,omitempty"`    // Explicitly requested model; empty means reevaluate on rerun
 	RequestedProvider string     `json:"requested_provider,omitempty"` // Explicitly requested provider; empty means reevaluate on rerun
-	Reasoning         string     `json:"reasoning,omitempty"`          // thorough, standard, fast (default: thorough)
+	Reasoning         string     `json:"reasoning,omitempty"`          // Legacy or exact reasoning level (default: thorough)
 	JobType           string     `json:"job_type"`                     // one of the JobType* constants above
 	Status            JobStatus  `json:"status"`
 	EnqueuedAt        time.Time  `json:"enqueued_at"`
 	StartedAt         *time.Time `json:"started_at,omitempty"`
+	StartedAtRaw      string     `json:"-"` // Exact persisted value for attempt-scoped writes
 	FinishedAt        *time.Time `json:"finished_at,omitempty"`
 	WorkerID          string     `json:"worker_id,omitempty"`
 	Error             string     `json:"error,omitempty"`
@@ -308,6 +309,7 @@ type Response struct {
 	JobID     *int64    `json:"job_id,omitempty"`    // For job/review-based responses
 	Responder string    `json:"responder"`
 	Response  string    `json:"response"`
+	Source    string    `json:"source,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 
 	// Sync fields
@@ -329,24 +331,29 @@ type AutoDesignStatus struct {
 }
 
 type DaemonStatus struct {
-	Version             string `json:"version"`
-	QueuedJobs          int    `json:"queued_jobs"`
-	RunningJobs         int    `json:"running_jobs"`
-	CompletedJobs       int    `json:"completed_jobs"`
-	FailedJobs          int    `json:"failed_jobs"`
-	CanceledJobs        int    `json:"canceled_jobs"`
-	AppliedJobs         int    `json:"applied_jobs"`
-	RebasedJobs         int    `json:"rebased_jobs"`
-	SkippedJobs         int    `json:"skipped_jobs"`
-	ActiveWorkers       int    `json:"active_workers"`
-	MaxWorkers          int    `json:"max_workers"`
-	QueuePaused         bool   `json:"queue_paused"`
-	Network             string `json:"network,omitempty"`
-	Address             string `json:"address,omitempty"`
-	Port                int    `json:"port,omitempty"`
-	MachineID           string `json:"machine_id,omitempty"`            // Local machine ID for remote job detection
-	ConfigReloadedAt    string `json:"config_reloaded_at,omitempty"`    // Last config reload timestamp (RFC3339Nano)
-	ConfigReloadCounter uint64 `json:"config_reload_counter,omitempty"` // Monotonic reload counter (for sub-second detection)
+	ActiveSnoozes        []AgentHookSnooze `json:"active_snoozes"`
+	Version              string            `json:"version"`
+	QueuedJobs           int               `json:"queued_jobs"`
+	RunningJobs          int               `json:"running_jobs"`
+	CompletedJobs        int               `json:"completed_jobs"`
+	FailedJobs           int               `json:"failed_jobs"`
+	CanceledJobs         int               `json:"canceled_jobs"`
+	AppliedJobs          int               `json:"applied_jobs"`
+	RebasedJobs          int               `json:"rebased_jobs"`
+	SkippedJobs          int               `json:"skipped_jobs"`
+	ActiveWorkers        int               `json:"active_workers"`
+	MaxWorkers           int               `json:"max_workers"`
+	QueuePaused          bool              `json:"queue_paused"`
+	UpdateDraining       bool              `json:"update_draining"`
+	UpdateDrainPolicy    string            `json:"update_drain_policy,omitempty"`
+	UpdateDrainExpiresAt string            `json:"update_drain_expires_at,omitempty"`
+	Network              string            `json:"network,omitempty"`
+	Address              string            `json:"address,omitempty"`
+	Port                 int               `json:"port,omitempty"`
+	MachineID            string            `json:"machine_id,omitempty"`            // Local machine ID for remote job detection
+	ConfigReloadedAt     string            `json:"config_reloaded_at,omitempty"`    // Last config reload timestamp (RFC3339Nano)
+	ConfigReloadCounter  uint64            `json:"config_reload_counter,omitempty"` // Monotonic reload counter (for sub-second detection)
+	WebCapabilities      []string          `json:"web_capabilities"`
 
 	AutoDesign *AutoDesignStatus `json:"auto_design,omitempty"` // Auto design review counters; nil when disabled everywhere
 }

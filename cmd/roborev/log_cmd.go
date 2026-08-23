@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"go.kenn.io/roborev/internal/daemon"
+	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/streamfmt"
 )
 
@@ -19,6 +20,7 @@ func logCmd() *cobra.Command {
 	var (
 		showPath  bool
 		rawOutput bool
+		dbPath    string
 	)
 
 	cmd := &cobra.Command{
@@ -50,28 +52,28 @@ Examples:
 				return nil
 			}
 
-			f, err := os.Open(daemon.JobLogPath(jobID))
-			if err != nil {
-				return fmt.Errorf(
-					"no log for job %d (file: %s)",
-					jobID, daemon.JobLogPath(jobID),
-				)
-			}
-			defer f.Close()
-
 			if rawOutput {
-				_, err := io.Copy(out, f)
-				if isBrokenPipe(err) {
+				f, err := os.Open(daemon.JobLogPath(jobID))
+				if err != nil {
+					return noJobLogError(jobID)
+				}
+				_, copyErr := io.Copy(out, f)
+				closeErr := f.Close()
+				if isBrokenPipe(copyErr) {
+					if closeErr != nil {
+						return fmt.Errorf("closing log: %w", closeErr)
+					}
 					return nil
 				}
+				err = errors.Join(copyErr, closeErr)
 				if err != nil {
 					return fmt.Errorf("reading log: %w", err)
 				}
 				return nil
 			}
 
-			err = streamfmt.RenderLog(
-				f, out, streamfmt.WriterIsTerminal(out),
+			err = renderJobLog(
+				jobID, out, streamfmt.WriterIsTerminal(out), dbPath,
 			)
 			if isBrokenPipe(err) {
 				return nil
@@ -88,9 +90,51 @@ Examples:
 		&rawOutput, "raw", false,
 		"print raw log bytes without formatting",
 	)
+	cmd.Flags().StringVar(
+		&dbPath, "db", storage.DefaultDBPath(),
+		"path to sqlite database used for log metadata",
+	)
 
 	cmd.AddCommand(logCleanCmd())
 	return cmd
+}
+
+func noJobLogError(jobID int64) error {
+	return fmt.Errorf(
+		"no log for job %d (file: %s)",
+		jobID, daemon.JobLogPath(jobID),
+	)
+}
+
+func renderJobLog(
+	jobID int64, out io.Writer, isTTY bool, dbPath string,
+) (err error) {
+	f, err := os.Open(daemon.JobLogPath(jobID))
+	if err != nil {
+		return noJobLogError(jobID)
+	}
+	defer func() { err = errors.Join(err, f.Close()) }()
+
+	db, err := storage.OpenReadOnly(dbPath)
+	if err != nil {
+		return fmt.Errorf("load metadata for formatted log (use --raw for an orphaned log): %w", err)
+	}
+	defer func() { err = errors.Join(err, db.Close()) }()
+	job, err := db.GetJobByID(jobID)
+	if err != nil {
+		return fmt.Errorf("load metadata for formatted log (use --raw for an orphaned log): %w", err)
+	}
+
+	identity, err := daemon.ResolveJobLogIdentity(job)
+	if err != nil {
+		return fmt.Errorf("load formatted log identity: %w", err)
+	}
+	decoder := streamfmt.DecoderForAgent(identity.Agent)
+	if identity.Source == storage.JobSourceAutoDesign {
+		decoder = streamfmt.LegacyMixedDecoder(identity.Agent)
+	}
+	fmtr := streamfmt.New(out, isTTY, decoder)
+	return streamfmt.RenderLogWith(f, fmtr)
 }
 
 // isBrokenPipe returns true if err is a broken pipe (EPIPE) error,

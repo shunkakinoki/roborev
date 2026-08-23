@@ -121,6 +121,15 @@ The agent reads the review findings, applies changes, commits, and closes the
 review. This is a one-shot fix. For an iterative loop with re-review, see
 [`roborev refine`](/guides/auto-fixing/).
 
+To require the fix agent to verify suggestions rather than apply them blindly,
+set global [`fix_guidelines`](/configuration/#fix-guidelines). The policy
+reaches direct fixes, batch fixes, and commit retries. It does not change the
+separate `analyze --fix` or `refine` workflows. When the agent intentionally
+leaves a finding unchanged, the job records the no-change outcome and the
+agent's explanation before it closes. A policy-aware batch records a neutral
+batch outcome and preserves the agent's fixed or skipped disposition for every
+job ID.
+
 Use `--batch` to concatenate multiple reviews into a single prompt so the agent
 sees all findings at once. This is faster and gives the agent more context to
 make coordinated fixes across related issues. Reviews are packed into batches
@@ -313,7 +322,7 @@ max_prompt_size = 204800
 |------|-------------|
 | `--agent <name>` | Agent to use for analysis (default: from config) |
 | `--model <model>` | Model for analysis agent |
-| `--reasoning <level>` | Reasoning depth: `fast`, `standard`, or `thorough` |
+| `--reasoning <level>` | Legacy or exact reasoning level; see [Reasoning Levels](/configuration/#reasoning-levels) |
 | `--branch [name]` | Analyze files changed on branch (optionally specify branch name with `--branch=name`) |
 | `--base <branch>` | Base branch for `--branch` comparison (default: auto-detect) |
 | `--wait` | Wait for job to complete and show result |
@@ -332,7 +341,7 @@ max_prompt_size = 204800
 |------|-------------|
 | `--agent <name>` | Agent to use for fixes (default: from config) |
 | `--model <model>` | Model for fix agent |
-| `--reasoning <level>` | Reasoning depth: `fast`, `standard`, or `thorough` |
+| `--reasoning <level>` | Legacy or exact reasoning level; see [Reasoning Levels](/configuration/#reasoning-levels) |
 | `--quiet` | Suppress agent output |
 | `--open` | Fix all open reviews on the current branch (default when no job IDs given) |
 | `--batch` | Concatenate multiple reviews into a single agent prompt instead of fixing one at a time |

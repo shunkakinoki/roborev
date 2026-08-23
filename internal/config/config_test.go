@@ -143,18 +143,20 @@ func TestSaveAndLoadGlobal(t *testing.T) {
 	}, "Expected MaxWorkers 8, got %d", loaded.MaxWorkers)
 }
 
-func TestLoadGlobalPiJSONSchemaExtension(t *testing.T) {
+func TestLoadGlobalPiConfig(t *testing.T) {
 	testenv.SetDataDir(t)
 
 	path := filepath.Join(DataDir(), "config.toml")
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
 	require.NoError(t, os.WriteFile(path, []byte(`[agent.pi]
 jsonschemaextension = "/opt/roborev/pi-json-schema/index.ts"
+launch_args = ["--extension", "npm:@example/pi-provider"]
 `), 0o600))
 
 	cfg, err := LoadGlobalFrom(path)
 	require.NoError(t, err)
 	assert.Equal(t, "/opt/roborev/pi-json-schema/index.ts", cfg.Agent.Pi.JSONSchemaExtension)
+	assert.Equal(t, []string{"--extension", "npm:@example/pi-provider"}, cfg.Agent.Pi.LaunchArgs)
 }
 
 func TestLoadGlobalCostConfigFromTOML(t *testing.T) {
@@ -284,6 +286,51 @@ func TestLoadGlobalConfigWithReviewGuidelines(t *testing.T) {
 	cfg, err := LoadGlobalFrom(path)
 	require.NoError(t, err)
 	assert.Equal(t, "Prefer small, focused changes.", cfg.ReviewGuidelines)
+}
+
+// If global fix policy loading breaks, autofix agents silently lose the user's
+// review-handling policy and fall back to applying every finding.
+func TestLoadGlobalConfigWithFixGuidelines(t *testing.T) {
+	testenv.SetDataDir(t)
+	path := GlobalConfigPath()
+	require.NoError(t, os.WriteFile(path, []byte(`fix_guidelines = "Verify findings before editing."`), 0o600))
+
+	cfg, err := LoadGlobal()
+	require.NoError(t, err)
+	assert.Equal(t, "Verify findings before editing.", cfg.FixGuidelines)
+}
+
+// If either repository loader silently accepts a global-only fix policy,
+// users can believe the policy is active while fixes still run without it.
+func TestRepoConfigLoadersRejectGlobalOnlyFixGuidelines(t *testing.T) {
+	dir := t.TempDir()
+	writeTestFile(t, dir, ".roborev.toml", `fix_guidelines = "Repo policy"`)
+	execGit(t, dir, "init")
+	execGit(t, dir, "config", "user.email", "test@example.com")
+	execGit(t, dir, "config", "user.name", "Test")
+	execGit(t, dir, "add", ".roborev.toml")
+	execGit(t, dir, "commit", "-m", "add config")
+	sha := execGit(t, dir, "rev-parse", "HEAD")
+
+	tests := []struct {
+		name string
+		load func() (*RepoConfig, error)
+	}{
+		{name: "filesystem", load: func() (*RepoConfig, error) {
+			return LoadRepoConfig(dir)
+		}},
+		{name: "git ref", load: func() (*RepoConfig, error) {
+			return LoadRepoConfigFromRef(dir, sha)
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := tt.load()
+			require.ErrorContains(t, err, "fix_guidelines")
+			assert.ErrorContains(t, err, "global")
+		})
+	}
 }
 
 func TestLoadRepoConfigWithGuidelines(t *testing.T) {
@@ -2103,6 +2150,18 @@ func TestResolveAgentForWorkflow(t *testing.T) {
 		{"medium global level-specific", "", nil, &Config{ReviewAgentMedium: "claude"}, "review", "medium", "claude"},
 		{"medium falls back to workflow", "", M{"review_agent": "claude"}, nil, "review", "medium", "claude"},
 		{"medium falls back to generic", "", M{"agent": "claude"}, nil, "review", "medium", "claude"},
+
+		// Exact native levels
+		{"low repo level-specific", "", M{"review_agent_low": "claude"}, nil, "review", "low", "claude"},
+		{"low global level-specific", "", nil, &Config{ReviewAgentLow: "claude"}, "review", "low", "claude"},
+		{"high repo level-specific", "", M{"review_agent_high": "claude"}, nil, "review", "high", "claude"},
+		{"xhigh global level-specific", "", nil, &Config{ReviewAgentXHigh: "claude"}, "review", "xhigh", "claude"},
+		{"max repo level-specific", "", M{"review_agent_max": "claude"}, nil, "review", "max", "claude"},
+		{"low falls back to legacy fast key", "", M{"review_agent_fast": "claude"}, nil, "review", "low", "claude"},
+		{"high falls back to legacy thorough key", "", nil, &Config{ReviewAgentThorough: "claude"}, "review", "high", "claude"},
+		{"xhigh falls back to legacy maximum key", "", M{"review_agent_maximum": "claude"}, nil, "review", "xhigh", "claude"},
+		{"max falls back to legacy maximum key", "", nil, &Config{ReviewAgentMaximum: "claude"}, "review", "max", "claude"},
+		{"exact key overrides legacy fallback", "", M{"review_agent_low": "droid", "review_agent_fast": "claude"}, nil, "review", "low", "droid"},
 	}
 
 	for _, tt := range tests {
@@ -2396,6 +2455,13 @@ func TestResolveModelForWorkflow(t *testing.T) {
 		{"design level-specific model", "", M{"design_model": "gpt-4", "design_model_fast": "claude-3"}, nil, "design", "fast", "claude-3"},
 		{"design falls back to generic model", "", M{"model": "gpt-4"}, nil, "design", "fast", "gpt-4"},
 		{"design isolated from review model", "", M{"review_model": "gpt-4"}, nil, "design", "fast", ""},
+
+		// Exact native levels
+		{"low repo level-specific", "", M{"review_model_low": "gpt-low"}, nil, "review", "low", "gpt-low"},
+		{"high global level-specific", "", nil, &Config{ReviewModelHigh: "gpt-high"}, "review", "high", "gpt-high"},
+		{"xhigh repo level-specific", "", M{"review_model_xhigh": "gpt-xhigh"}, nil, "review", "xhigh", "gpt-xhigh"},
+		{"max global level-specific", "", nil, &Config{ReviewModelMax: "gpt-max"}, "review", "max", "gpt-max"},
+		{"xhigh falls back to legacy maximum key", "", M{"review_model_maximum": "legacy-model"}, nil, "review", "xhigh", "legacy-model"},
 	}
 
 	for _, tt := range tests {
@@ -2773,6 +2839,41 @@ discord_webhook_url = "https://discord.com/api/webhooks/123/token"
 	assert.Equal(t, "https://discord.com/api/webhooks/123/token", cfg.CI.DiscordWebhookURL)
 }
 
+func TestNormalizeReasoning(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{name: "legacy fast", input: "fast", want: "fast"},
+		{name: "legacy standard", input: "standard", want: "standard"},
+		{name: "legacy thorough", input: "thorough", want: "thorough"},
+		{name: "legacy maximum", input: "maximum", want: "maximum"},
+		{name: "exact low", input: "low", want: "low"},
+		{name: "exact medium", input: "medium", want: "medium"},
+		{name: "exact high", input: "high", want: "high"},
+		{name: "exact xhigh", input: "xhigh", want: "xhigh"},
+		{name: "exact max", input: "max", want: "max"},
+		{name: "normalizes case and space", input: "  XHIGH  ", want: "xhigh"},
+		{name: "empty", input: "", want: ""},
+		{name: "unknown", input: "ultra", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := NormalizeReasoning(tt.input)
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Empty(t, got)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestNormalizeMinSeverity(t *testing.T) {
 	tests := []struct {
 		input   string
@@ -2869,13 +2970,13 @@ reasoning = "standard"
 
 func TestInstallationIDForOwner(t *testing.T) {
 	t.Run("map lookup", func(t *testing.T) {
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{
+		ci := CIConfig{
 			GitHubAppInstallations: map[string]int64{
 				"wesm":        111111,
 				"roborev-dev": 222222,
 			},
 			GitHubAppInstallationID: 999999,
-		}}
+		}
 		if got := ci.InstallationIDForOwner("wesm"); got != 111111 {
 			assert.Condition(t, func() bool {
 				return false
@@ -2889,10 +2990,10 @@ func TestInstallationIDForOwner(t *testing.T) {
 	})
 
 	t.Run("falls back to singular", func(t *testing.T) {
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{
+		ci := CIConfig{
 			GitHubAppInstallations:  map[string]int64{"wesm": 111111},
 			GitHubAppInstallationID: 999999,
-		}}
+		}
 		if got := ci.InstallationIDForOwner("unknown-org"); got != 999999 {
 			assert.Condition(t, func() bool {
 				return false
@@ -2910,10 +3011,10 @@ func TestInstallationIDForOwner(t *testing.T) {
 	})
 
 	t.Run("zero mapped value falls back to singular", func(t *testing.T) {
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{
+		ci := CIConfig{
 			GitHubAppInstallations:  map[string]int64{"wesm": 0},
 			GitHubAppInstallationID: 999999,
-		}}
+		}
 		if got := ci.InstallationIDForOwner("wesm"); got != 999999 {
 			assert.Condition(t, func() bool {
 				return false
@@ -2922,9 +3023,9 @@ func TestInstallationIDForOwner(t *testing.T) {
 	})
 
 	t.Run("case-insensitive lookup after normalization", func(t *testing.T) {
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{
+		ci := CIConfig{
 			GitHubAppInstallations: map[string]int64{"Wesm": 111111, "RoboRev-Dev": 222222},
-		}}
+		}
 		if err := ci.NormalizeInstallations(); err != nil {
 			require.Condition(t, func() bool {
 				return false
@@ -2950,9 +3051,9 @@ func TestInstallationIDForOwner(t *testing.T) {
 
 func TestNormalizeInstallations(t *testing.T) {
 	t.Run("lowercases keys", func(t *testing.T) {
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{
+		ci := CIConfig{
 			GitHubAppInstallations: map[string]int64{"Wesm": 111111, "RoboRev-Dev": 222222},
-		}}
+		}
 		if err := ci.NormalizeInstallations(); err != nil {
 			require.Condition(t, func() bool {
 				return false
@@ -2985,9 +3086,9 @@ func TestNormalizeInstallations(t *testing.T) {
 	})
 
 	t.Run("case-colliding keys returns error", func(t *testing.T) {
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{
+		ci := CIConfig{
 			GitHubAppInstallations: map[string]int64{"wesm": 111111, "Wesm": 222222},
-		}}
+		}
 		err := ci.NormalizeInstallations()
 		if err == nil {
 			require.Condition(t, func() bool {
@@ -3042,11 +3143,11 @@ RoboRev-Dev = 222222
 
 func TestGitHubAppConfigured_MultiInstall(t *testing.T) {
 	t.Run("configured with map only", func(t *testing.T) {
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{
+		ci := CIConfig{
 			GitHubAppID:            12345,
 			GitHubAppPrivateKey:    "~/.roborev/app.pem",
 			GitHubAppInstallations: map[string]int64{"wesm": 111111},
-		}}
+		}
 		if !ci.GitHubAppConfigured() {
 			assert.Condition(t, func() bool {
 				return false
@@ -3055,11 +3156,11 @@ func TestGitHubAppConfigured_MultiInstall(t *testing.T) {
 	})
 
 	t.Run("configured with singular only", func(t *testing.T) {
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{
+		ci := CIConfig{
 			GitHubAppID:             12345,
 			GitHubAppPrivateKey:     "~/.roborev/app.pem",
 			GitHubAppInstallationID: 111111,
-		}}
+		}
 		if !ci.GitHubAppConfigured() {
 			assert.Condition(t, func() bool {
 				return false
@@ -3068,10 +3169,10 @@ func TestGitHubAppConfigured_MultiInstall(t *testing.T) {
 	})
 
 	t.Run("not configured without any installation", func(t *testing.T) {
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{
+		ci := CIConfig{
 			GitHubAppID:         12345,
 			GitHubAppPrivateKey: "~/.roborev/app.pem",
-		}}
+		}
 		if ci.GitHubAppConfigured() {
 			assert.Condition(t, func() bool {
 				return false
@@ -3080,10 +3181,10 @@ func TestGitHubAppConfigured_MultiInstall(t *testing.T) {
 	})
 
 	t.Run("not configured without private key", func(t *testing.T) {
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{
+		ci := CIConfig{
 			GitHubAppID:             12345,
 			GitHubAppInstallationID: 111111,
-		}}
+		}
 		if ci.GitHubAppConfigured() {
 			assert.Condition(t, func() bool {
 				return false
@@ -3105,7 +3206,7 @@ func TestGitHubAppPrivateKeyResolved_TildeExpansion(t *testing.T) {
 	}
 
 	t.Run("inline PEM returned directly", func(t *testing.T) {
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{GitHubAppPrivateKey: pemContent}}
+		ci := CIConfig{GitHubAppPrivateKey: pemContent}
 		got, err := ci.GitHubAppPrivateKeyResolved()
 		if err != nil {
 			require.Condition(t, func() bool {
@@ -3120,7 +3221,7 @@ func TestGitHubAppPrivateKeyResolved_TildeExpansion(t *testing.T) {
 	})
 
 	t.Run("absolute path reads file", func(t *testing.T) {
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{GitHubAppPrivateKey: pemFile}}
+		ci := CIConfig{GitHubAppPrivateKey: pemFile}
 		got, err := ci.GitHubAppPrivateKeyResolved()
 		if err != nil {
 			require.Condition(t, func() bool {
@@ -3152,7 +3253,7 @@ func TestGitHubAppPrivateKeyResolved_TildeExpansion(t *testing.T) {
 			}, err)
 		}
 
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{GitHubAppPrivateKey: "~/.roborev/test.pem"}}
+		ci := CIConfig{GitHubAppPrivateKey: "~/.roborev/test.pem"}
 		got, err := ci.GitHubAppPrivateKeyResolved()
 		if err != nil {
 			require.Condition(t, func() bool {
@@ -3167,7 +3268,7 @@ func TestGitHubAppPrivateKeyResolved_TildeExpansion(t *testing.T) {
 	})
 
 	t.Run("empty after expansion returns error", func(t *testing.T) {
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{GitHubAppPrivateKey: ""}}
+		ci := CIConfig{GitHubAppPrivateKey: ""}
 		_, err := ci.GitHubAppPrivateKeyResolved()
 		if err == nil {
 			assert.Condition(t, func() bool {
@@ -4985,4 +5086,265 @@ func TestSaveGlobalToHasNoCommentedExample(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotContains(t, string(raw), "# [[hooks]]",
 		"normal rewrites must not reintroduce the commented example")
+}
+
+func TestSaveGlobalToRejectsInvalidWebConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*WebConfig)
+		wantErr string
+	}{
+		{
+			name: "weak token",
+			mutate: func(web *WebConfig) {
+				web.AuthToken = "weak"
+			},
+			wantErr: "base64url-encoded 32-byte",
+		},
+		{
+			name: "non-loopback listener",
+			mutate: func(web *WebConfig) {
+				web.Listen = "0.0.0.0:7374"
+			},
+			wantErr: "loopback",
+		},
+		{
+			name: "unauthenticated public origin",
+			mutate: func(web *WebConfig) {
+				web.PublicOrigin = "https://reviews.example.com"
+			},
+			wantErr: "auth token",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			require.NoError(t, SaveGlobalTo(path, DefaultConfig()))
+			before, err := os.ReadFile(path)
+			require.NoError(t, err)
+
+			cfg := DefaultConfig()
+			tt.mutate(&cfg.Web)
+			err = SaveGlobalTo(path, cfg)
+
+			require.ErrorContains(t, err, tt.wantErr)
+			after, readErr := os.ReadFile(path)
+			require.NoError(t, readErr)
+			assert.Equal(t, before, after)
+		})
+	}
+}
+
+func TestWebConfigDefaultsAndSensitiveToken(t *testing.T) {
+	cfg := DefaultConfig()
+	assert.True(t, cfg.Web.Enabled)
+	assert.Equal(t, "127.0.0.1:0", cfg.Web.Listen)
+	assert.True(t, IsSensitiveKey("web.auth_token"))
+	assert.Equal(t, "****cret", MaskValue("test-secret"))
+}
+
+func TestWebConfigNormalization(t *testing.T) {
+	const strongToken = "MDEyMzQ1Njc4OWFiY2RlZmdoaWprbG1ub3BxcnN0dXY"
+	tests := []struct {
+		name         string
+		contents     string
+		wantOrigin   string
+		wantAuthMode string
+		wantErr      string
+	}{
+		{name: "loopback defaults", contents: "[web]\nlisten = \"127.0.0.1:0\"\n"},
+		{name: "canonical public origin", contents: "[web]\npublic_origin = \"HTTPS://REVIEWS.EXAMPLE.COM:443\"\nauth_token = \"" + strongToken + "\"\n", wantOrigin: "https://reviews.example.com"},
+		{name: "proxy authentication", contents: "[web]\nlisten = \"127.0.0.1:7374\"\npublic_origin = \"https://reviews.example.com\"\nauth_mode = \"proxy\"\n", wantOrigin: "https://reviews.example.com", wantAuthMode: WebAuthModeProxy},
+		{name: "reject unknown auth mode", contents: "[web]\nauth_mode = \"trusted\"\n", wantErr: "auth mode"},
+		{name: "reject proxy mode without origin", contents: "[web]\nauth_mode = \"proxy\"\n", wantErr: "public origin"},
+		{name: "reject proxy mode over HTTP", contents: "[web]\npublic_origin = \"http://127.0.0.1:7374\"\nauth_mode = \"proxy\"\n", wantErr: "HTTPS"},
+		{name: "reject proxy mode with inline token", contents: "[web]\npublic_origin = \"https://reviews.example.com\"\nauth_mode = \"proxy\"\nauth_token = \"" + strongToken + "\"\n", wantErr: "must not configure"},
+		{name: "reject proxy mode with token file", contents: "[web]\npublic_origin = \"https://reviews.example.com\"\nauth_mode = \"proxy\"\nauth_token_file = \"/does/not/need/to/exist\"\n", wantErr: "must not configure"},
+		{name: "reject origin path", contents: "[web]\npublic_origin = \"https://reviews.example.com/path\"\n", wantErr: "origin"},
+		{name: "reject origin userinfo", contents: "[web]\npublic_origin = \"https://user@reviews.example.com\"\n", wantErr: "origin"},
+		{name: "reject remote HTTP", contents: "[web]\npublic_origin = \"http://reviews.example.com\"\n", wantErr: "HTTPS"},
+		{name: "reject unauthenticated proxy origin", contents: "[web]\nlisten = \"127.0.0.1:7374\"\npublic_origin = \"https://reviews.example.com\"\n", wantErr: "auth token"},
+		{name: "reject unauthenticated remote bind", contents: "[web]\nlisten = \"0.0.0.0:7374\"\npublic_origin = \"https://reviews.example.com\"\n", wantErr: "loopback"},
+		{name: "reject weak remote token", contents: "[web]\nlisten = \"127.0.0.1:7374\"\npublic_origin = \"https://reviews.example.com\"\nauth_token = \"secret\"\n", wantErr: "base64url-encoded 32-byte"},
+		{name: "reject authenticated remote bind", contents: "[web]\nlisten = \"0.0.0.0:7374\"\npublic_origin = \"https://reviews.example.com\"\nauth_token = \"" + strongToken + "\"\n", wantErr: "loopback"},
+		{name: "reject empty origin hostname", contents: "[web]\npublic_origin = \"https://:443\"\nauth_token = \"" + strongToken + "\"\n", wantErr: "origin"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			require.NoError(t, os.WriteFile(path, []byte(tt.contents), 0o600))
+			cfg, err := LoadGlobalFrom(path)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantOrigin, cfg.Web.PublicOrigin)
+			assert.Equal(t, tt.wantAuthMode, cfg.Web.AuthMode)
+		})
+	}
+}
+
+func TestWebConfigBasePathNormalization(t *testing.T) {
+	tests := []struct {
+		name         string
+		basePath     string
+		wantBasePath string
+		wantErr      string
+	}{
+		{name: "empty", basePath: "", wantBasePath: ""},
+		{name: "canonical", basePath: "/roborev-ci", wantBasePath: "/roborev-ci"},
+		{name: "missing leading slash", basePath: "roborev-ci", wantErr: "absolute"},
+		{name: "trailing slash", basePath: "/roborev-ci/", wantErr: "trailing"},
+		{name: "query", basePath: "/roborev-ci?tab=all", wantErr: "query"},
+		{name: "fragment", basePath: "/roborev-ci#reviews", wantErr: "fragment"},
+		{name: "dot segment", basePath: "/roborev/./ci", wantErr: "canonical"},
+		{name: "dot dot segment", basePath: "/roborev/../ci", wantErr: "canonical"},
+		{name: "percent escape", basePath: "/ui%2Freviews", wantErr: "percent escapes"},
+		{name: "backslash", basePath: `/ui\reviews`, wantErr: "backslashes"},
+		{name: "control character", basePath: "/ui\t/reviews", wantErr: "control characters"},
+		{name: "leading whitespace", basePath: " /ui", wantErr: "surrounding whitespace"},
+		{name: "trailing whitespace", basePath: "/ui ", wantErr: "surrounding whitespace"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			contents := "[web]\nbase_path = " + fmt.Sprintf("%q", tt.basePath) + "\n"
+			require.NoError(t, os.WriteFile(path, []byte(contents), 0o600))
+
+			cfg, err := LoadGlobalFrom(path)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantBasePath, cfg.Web.BasePath)
+		})
+	}
+}
+
+func TestWebAuthTokenFile(t *testing.T) {
+	const strongToken = "MDEyMzQ1Njc4OWFiY2RlZmdoaWprbG1ub3BxcnN0dXY"
+	terminalToken := strongToken + "\n"
+	emptyToken := ""
+	multipleLineToken := strongToken + "\nsecond-line\n"
+	whitespaceToken := strongToken + " "
+	malformedToken := "not-a-token"
+	inlineToken := strongToken
+
+	tests := []struct {
+		name         string
+		fileContents *string
+		inlineToken  string
+		wantToken    string
+		wantErr      string
+	}{
+		{
+			name:         "terminal newline is accepted",
+			fileContents: &terminalToken,
+			wantToken:    strongToken,
+		},
+		{
+			name:         "missing file fails closed",
+			fileContents: nil,
+			wantErr:      "read web auth token file",
+		},
+		{
+			name:         "empty file fails closed",
+			fileContents: &emptyToken,
+			wantErr:      "base64url-encoded 32-byte",
+		},
+		{
+			name:         "multiple lines fail closed",
+			fileContents: &multipleLineToken,
+			wantErr:      "single token",
+		},
+		{
+			name:         "whitespace fails closed",
+			fileContents: &whitespaceToken,
+			wantErr:      "single token",
+		},
+		{
+			name:         "malformed token fails closed",
+			fileContents: &malformedToken,
+			wantErr:      "base64url-encoded 32-byte",
+		},
+		{
+			name:         "inline and file are mutually exclusive",
+			fileContents: &inlineToken,
+			inlineToken:  strongToken,
+			wantErr:      "mutually exclusive",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tokenPath := filepath.Join(t.TempDir(), "web-token")
+			if tt.fileContents != nil {
+				require.NoError(t, os.WriteFile(tokenPath, []byte(*tt.fileContents), 0o600))
+			}
+			configPath := filepath.Join(t.TempDir(), "config.toml")
+			contents := "[web]\nlisten = \"127.0.0.1:7374\"\nauth_token_file = " + fmt.Sprintf("%q", tokenPath) + "\n"
+			if tt.inlineToken != "" {
+				contents += "auth_token = " + fmt.Sprintf("%q", tt.inlineToken) + "\n"
+			}
+			require.NoError(t, os.WriteFile(configPath, []byte(contents), 0o600))
+
+			cfg, err := LoadGlobalFrom(configPath)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Empty(t, cfg.Web.AuthToken)
+			assert.Equal(t, tokenPath, cfg.Web.AuthTokenFile)
+			resolved, err := cfg.Web.ResolveAuthToken()
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantToken, resolved)
+		})
+	}
+}
+
+func TestRemoteWebConfigAcceptsTokenFile(t *testing.T) {
+	const strongToken = "MDEyMzQ1Njc4OWFiY2RlZmdoaWprbG1ub3BxcnN0dXY"
+	tokenPath := filepath.Join(t.TempDir(), "web-token")
+	require.NoError(t, os.WriteFile(tokenPath, []byte(strongToken+"\n"), 0o600))
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(t, os.WriteFile(configPath, []byte("[web]\npublic_origin = \"https://reviews.example.com\"\nauth_token_file = "+fmt.Sprintf("%q", tokenPath)+"\n"), 0o600))
+
+	cfg, err := LoadGlobalFrom(configPath)
+	require.NoError(t, err)
+	resolved, err := cfg.Web.ResolveAuthToken()
+	require.NoError(t, err)
+	assert.Equal(t, strongToken, resolved)
+}
+
+func TestDisabledWebConfigIgnoresBasePathAndTokenFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(t, os.WriteFile(path, []byte(`[web]
+enabled = false
+base_path = "not-an-absolute-path/"
+auth_token_file = "/path/that/does/not/exist"
+`), 0o600))
+
+	cfg, err := LoadGlobalFrom(path)
+	require.NoError(t, err)
+	assert.False(t, cfg.Web.Enabled)
+}
+
+func TestDisabledWebConfigIgnoresInactiveSettings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(t, os.WriteFile(path, []byte(`[web]
+enabled = false
+listen = "not-a-listener"
+public_origin = "not-an-origin"
+auth_mode = "unknown"
+auth_token = "weak"
+`), 0o600))
+
+	cfg, err := LoadGlobalFrom(path)
+	require.NoError(t, err)
+	assert.False(t, cfg.Web.Enabled)
 }

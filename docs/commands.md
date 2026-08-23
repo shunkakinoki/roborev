@@ -13,7 +13,8 @@ description: Quick reference for all roborev commands and flags
 roborev init [--agent <name>]    # Initialize repo + daemon + hook
                                  # --no-daemon: skip auto-starting daemon
 roborev fix                      # Fix open reviews
-roborev status                   # Check daemon and queue
+roborev daemon status            # Check daemon, web UI, and queue
+roborev status                   # Backward-compatible status alias
 roborev pause                    # Pause queue processing
 roborev unpause                  # Resume queue processing
 roborev cancel <job_id>          # Cancel one queued or running job
@@ -25,9 +26,16 @@ roborev tui                      # Interactive terminal UI
                                  # --branch: pre-filter to branch
                                  # --no-quit: suppress keyboard quit
                                  # --control-socket: custom socket path
+roborev ui                       # Open the native browser application
+roborev ui 42                    # Open browser review detail for local job 42
 roborev version                  # Show version
 roborev version --json           # Show stable machine-readable version data
 ```
+
+When the binary was built without the production web assets, the human-readable
+`roborev version` output appends
+`(no embedded web assets; reinstall from an official release or build with 'make build')`
+to the version line.
 
 ### Version JSON contract
 
@@ -35,7 +43,7 @@ roborev version --json           # Show stable machine-readable version data
 requiring a repository or a running daemon:
 
 ```json
-{"name":"roborev","version":"v0.62.1"}
+{"name":"roborev","version":"v0.62.1","web_assets":true}
 ```
 
 The stable fields are:
@@ -44,6 +52,7 @@ The stable fields are:
 |-------|------|-------------|
 | `name` | string | Canonical tool name; always `roborev` |
 | `version` | string | Build version, using the release semantic version for release builds |
+| `web_assets` | bool | Whether this binary embeds the production web assets required to serve the [browser UI](/web-ui/) |
 
 Consumers should ignore additional fields so the contract can grow compatibly.
 
@@ -86,8 +95,8 @@ roborev review --branch --panel none          # Force single-agent review
 | `--agent <name>` | Use a specific agent for review: a built-in (`codex`, `claude-code`, `gemini`, `copilot`, `opencode`, `cursor`, `kiro`, `kilo`, `droid`, `pi`, `grok`) or a configured ACP agent |
 | `-m, --model <model>` | Model to use (format varies by agent) |
 | `--type <type>` | Review type (`security`, `design`, `lookahead`); changes system prompt |
-| `--reasoning <level>` | Set reasoning depth (`maximum`/`thorough`/`standard`/`fast`) |
-| `--fast` | Shorthand for `--reasoning fast` |
+| `--reasoning <level>` | Set a reasoning level; prefer exact `low`/`medium`/`high`/`xhigh`/`max`, while legacy presets remain supported. See [Reasoning Levels](/configuration/#reasoning-levels) |
+| `--fast` | Legacy shorthand for `--reasoning fast` |
 | `--min-severity <level>` | Only report findings at or above this severity (`low`/`medium`/`high`/`critical`) |
 | `--panel <name or none>` | Run a named review panel. Use `none` to bypass configured defaults |
 | `--local` | Run review locally without the daemon (streams output to console) |
@@ -131,8 +140,10 @@ roborev show --prompt <job_id>   # Show the prompt sent to the agent
 roborev list                     # List jobs for current repo/branch
 roborev list --open              # List only open reviews
 roborev list --closed            # List only closed reviews
-roborev tui                      # Interactive browser
+roborev tui                      # Interactive terminal UI
 roborev tui --repo --branch      # Pre-filtered to current repo+branch
+roborev ui                       # Open the browser review workspace
+roborev ui 42                    # Deep-link to browser review detail
 roborev log <job_id>             # View job log
 ```
 
@@ -142,8 +153,26 @@ roborev log <job_id>             # View job log
 | `--prompt` | Show the prompt sent to the agent instead of the review output |
 | `--json` | Output as JSON for machine-readable workflows |
 
+When the argument is a numeric job ID, `--prompt` can display the stored prompt
+while the job is queued or running; review output does not exist until the job
+completes.
+
 `roborev show` displays review comments after the review output when comments
 exist, matching the layout in the TUI review detail view.
+
+`roborev ui` starts the daemon when needed, reads the browser origin and path
+prefix from the live daemon runtime, and opens `/reviews` below that prefix when
+one is configured. An optional positive numeric job ID opens `/reviews/<job-id>`
+below the same prefix. Job IDs are local to that daemon's SQLite database, so a
+numeric deep link is not portable to another machine even when review data is
+synchronized. Authentication tokens are never placed in the launch URL. The
+browser listener is enabled on loopback by default, so an installed release
+needs no additional configuration for local use: run `roborev ui` and the
+application displays the reviews from the same SQLite database used by the CLI
+and terminal UI.
+
+See [Browser UI](/web-ui/) for analytics definitions, remote HTTPS access, and
+the production Tailscale Serve setup.
 
 For panel parent reviews, `roborev show` also displays a one-line reviewer
 summary. `roborev show --json` includes an additive `panel` object with the run
@@ -283,12 +312,56 @@ grouped from related completed review jobs before the database's first panel
 activity. It is intended for a one-time historical backfill. Legacy and
 panel-era cursors are namespaced and cannot be resumed against each other.
 
+## Exporting CI Costs
+
+```bash
+roborev export ci-costs
+roborev export ci-costs --since 2026-07-01 --until 2026-07-31
+roborev export ci-costs --limit 1000
+roborev export ci-costs --cursor "$NEXT_CURSOR" --until 2026-08-01
+roborev export ci-costs --legacy
+```
+
+| Flag | Description |
+|------|-------------|
+| `--format json` | Output format. JSON is the only supported format and the default |
+| `--since <time>` | Inclusive `finished_at` lower bound. Accepts RFC3339 or `YYYY-MM-DD` |
+| `--until <time>` | `finished_at` upper bound. RFC3339 is exclusive; `YYYY-MM-DD` includes that full UTC day |
+| `--cursor <opaque>` | Resume strictly after a previous `next_cursor`. Mutually exclusive with `--since` |
+| `--limit <n>` | Maximum jobs to emit |
+| `--legacy` | Export the frozen pre-panel CI era as a one-time backfill instead of panel jobs |
+
+`roborev export ci-costs` emits one JSON document containing job-level cost
+records for CI review work. Eligible terminal attempts are included even when a
+later retry replaced them in a panel. Skipped, passthrough, pre-agent, and
+manual jobs are excluded. Each row contains `job_uuid`, `finished_at`, `agent`,
+`role`, `status`, and `cost_usd`.
+
+Cost is approximate and can be partial. A job whose agent ran but whose usage
+cannot be priced remains in the export with `cost_usd: null`. A known zero-cost
+job uses `0`, which is distinct from missing pricing. Consumers can therefore
+measure cost coverage without dropping eligible work.
+
+Rows are ordered by `(finished_at, job_id)` ascending for stable pagination. A
+fresh export over an overlapping window returns current pricing for every
+matching job, so an idempotent consumer can pick up prices stored or backfilled
+after an earlier export. Documents use the same stable `database_id`, opaque
+cursor, and exit-code `3` database-reset behavior as the other exports. Without
+`--limit`, the CLI follows cursors and emits all matching rows in one document.
+With `--limit`, it stops after the requested number and preserves the daemon's
+`truncated` and `next_cursor` fields for resumption.
+
+`--legacy` exports structurally identified CI review jobs from the frozen
+pre-panel era. It is intended for a one-time historical backfill. Legacy and
+panel-era cursors are namespaced and cannot be resumed against each other.
+
 ## Job Logs
 
 ```bash
 roborev log <job-id>             # Human-friendly rendered output
 roborev log --raw <job-id>       # Raw NDJSON bytes
 roborev log --path <job-id>      # Print the log file path
+roborev log --db <path> <job-id> # Read metadata from a custom database
 
 roborev log clean                # Remove logs older than 7 days
 roborev log clean --days 3       # Remove logs older than 3 days
@@ -298,11 +371,14 @@ roborev log clean --days 3       # Remove logs older than 3 days
 |------|-------------|
 | `--raw` | Print raw NDJSON without formatting |
 | `--path` | Print the log file path instead of contents |
+| `--db` | SQLite database used for log metadata |
 
 Job logs are persisted to `~/.roborev/logs/jobs/` so agent output remains
 available after daemon restarts. By default, `roborev log` renders NDJSON into
-compact, human-readable progress lines showing tool calls and agent text. Use
-`--raw` for the original NDJSON when scripting or debugging.
+compact, human-readable progress lines showing tool calls and agent text. It
+uses stored job metadata to select that renderer; use `--raw` for the original
+NDJSON when scripting, debugging, or reading an orphaned log file. When the
+daemon runs with a custom `--db` path, pass the same path to `roborev log`.
 
 The `clean` subcommand removes log files older than the specified number of days
 (default: 7).
@@ -560,6 +636,14 @@ Older agentsview versions still record token counts; the cost column stays blank
 for unpriced models and for jobs whose usage has not yet been fetched. The tilde
 marks the value as a model-pricing estimate rather than a billed amount.
 
+Fresh agent sessions can finish before agentsview has indexed their final usage.
+roborev briefly retries a missing session lookup before storing the job-log
+token fallback. The daemon then continues reconciling recent unpriced jobs (up
+to a week old) in the background, including after a restart, so a price that
+appears later is stored without an operator running a backfill. If the database
+missed the session ID, the daemon first recovers it from the per-job JSONL log
+when that log is still available.
+
 If you run a central usage service, configure `[cost] endpoint` to fetch usage
 over HTTP instead of through the local `agentsview` CLI. See
 [Cost Usage Endpoint](/configuration/#cost-usage-endpoint).
@@ -575,42 +659,72 @@ roborev backfill-tokens --dry-run   # Preview without writing
 |------|-------------|
 | `--dry-run` | Preview candidates without fetching or storing data |
 
-The backfill scans completed jobs that have a session ID but no stored token
-usage. Jobs whose session files have been deleted are skipped.
+The backfill scans eligible terminal jobs that need token or price data. This
+includes failed, canceled, and skipped jobs when an agent ran. Jobs whose
+session files have been deleted are skipped. Sessions reused by more than one
+started job are also skipped because their cumulative usage cannot be assigned
+safely to one job.
 
 ## CI Review
 
 ```bash
-roborev ci review                            # Auto-detect from GitHub Actions env
+roborev ci review                            # Auto-detect from GitHub Actions / GitLab CI env
 roborev ci review --ref HEAD~3..HEAD         # Explicit ref range
-roborev ci review --gh-repo myorg/myrepo --pr 42  # Explicit repo and PR
-roborev ci review --agent codex --agent gemini     # Multiple agents
-roborev ci review --comment                  # Post results as PR comment
+roborev ci review --gh-repo myorg/myrepo --pr 42  # Explicit GitHub repo and PR
+roborev ci review --gl-repo mygroup/myproject --pr 42  # Explicit GitLab project and MR
+roborev ci review --agent codex,gemini        # Multiple agents
+roborev ci review --comment                  # Post results as PR/MR comment
 ```
 
 | Flag | Description |
 |------|-------------|
-| `--ref <range>` | Git ref or range to review (default: auto-detect from `GITHUB_REF`) |
-| `--comment` | Post results as a PR comment via `gh` |
+| `--ref <range>` | Git ref or range to review (default: auto-detect from `GITHUB_REF` or `CI_COMMIT_SHA`) |
+| `--comment` | Post results as a PR comment (GitHub) or MR note (GitLab) |
 | `--gh-repo <owner/repo>` | GitHub repo (default: `GITHUB_REPOSITORY` env var) |
-| `--pr <number>` | PR number (default: extracted from `GITHUB_EVENT_PATH`) |
-| `--agent <names>` | Agents to use (repeatable, default: auto-detect) |
+| `--gl-repo <group/project>` | GitLab project path, subgroups allowed (default: `CI_MERGE_REQUEST_PROJECT_PATH`, then `CI_PROJECT_PATH`); mutually exclusive with `--gh-repo` |
+| `--gl-host <url>` | GitLab server URL or hostname; selects GitLab (default: `CI_SERVER_URL`, then `GITLAB_HOST`/`GL_HOST`); hardcode it in the job script when `GITLAB_TOKEN` is protected; mutually exclusive with `--gh-repo` |
+| `--pr <number>` | PR number / GitLab MR IID (default: `GITHUB_EVENT_PATH` or `CI_MERGE_REQUEST_IID`) |
+| `--agent <names>` | Agents to use (comma-separated, default: auto-detect) |
 | `--review-types <types>` | Review types to run (comma-separated: `security`, `design`, `lookahead`, `default`) |
-| `--reasoning <level>` | Reasoning depth (`thorough`/`standard`/`fast`) |
+| `--reasoning <level>` | Legacy (`fast`/`standard`/`thorough`/`maximum`) or exact (`low`/`medium`/`high`/`xhigh`/`max`) reasoning |
 | `--min-severity <level>` | Minimum severity to report (`low`/`medium`/`high`/`critical`) |
+| `--upsert-comments` | Update the previous roborev comment instead of adding one (overrides `[ci] upsert_comments`) |
 | `--synthesis-agent <name>` | Agent for combining multi-job results |
 
 Runs a one-shot review without a daemon or database. Designed for CI pipelines
 where you want review results as part of the build, not as a background service.
+With `--comment`, roborev calls the forge only when at least one completed agent
+produced substantive review output. Empty responses and roborev's empty-output
+placeholder do not qualify. If every agent fails before producing output, the
+command writes its diagnostic summary to the CI log, makes no comment request,
+and exits nonzero for actionable failures. An all-quota batch keeps its existing
+successful exit because there is no actionable review failure.
 
 In GitHub Actions, `ci review` auto-detects `GITHUB_REPOSITORY`, `GITHUB_REF`,
 and `GITHUB_EVENT_PATH` so you can run it with no flags. Outside GitHub Actions,
 pass `--gh-repo` and `--ref` explicitly.
 
+In GitLab CI, `ci review` auto-detects the project
+(`CI_MERGE_REQUEST_PROJECT_PATH`, the merge request's target project, falling
+back to `CI_PROJECT_PATH`), `CI_MERGE_REQUEST_IID`, `CI_SERVER_URL`, and the
+review range: `CI_MERGE_REQUEST_DIFF_BASE_SHA` as the base and
+`CI_MERGE_REQUEST_SOURCE_BRANCH_SHA` (merged results pipelines) or
+`CI_COMMIT_SHA` as the head. Forge detection precedence is: explicit flags
+(`--gl-repo`/`--gl-host` for GitLab, `--gh-repo` for GitHub), then GitLab CI
+(`GITLAB_CI=true`), then GitHub Actions (`GITHUB_ACTIONS=true`) — the GitLab
+indicator wins when both are set because a GitLab pipeline starter can inject
+`GITHUB_ACTIONS=true`, while the reverse requires committed workflow code.
+Posting an MR note requires a project access token with the `api` scope exposed
+as `GITLAB_TOKEN` — `CI_JOB_TOKEN` cannot create notes. When that token is a
+protected variable, hardcode `--gl-host https://gitlab.example.com` in the job
+script: `CI_SERVER_URL` is overridable by whoever starts the pipeline, the
+script is not. See the [GitLab Integration](/integrations/gitlab/) trust model.
+
 Exit codes: `0` on success or when all agents were skipped due to quota
 exhaustion, non-zero on real failures.
 
-See: [GitHub Integration](/integrations/github/)
+See: [GitHub Integration](/integrations/github/),
+[GitLab Integration](/integrations/gitlab/)
 
 ## GitHub Actions Setup
 
@@ -738,13 +852,14 @@ See: [Repository Management](/guides/repository-management/)
 roborev daemon start             # Start background daemon
 roborev daemon stop              # Stop daemon
 roborev daemon restart           # Restart daemon
+roborev daemon status            # Show daemon, web UI, and queue status
 roborev daemon run               # Run in foreground
 roborev pause                    # Pause queue processing
 roborev unpause                  # Resume queue processing
 roborev cancel <job_id>          # Cancel one queued or running job
 
-roborev status                   # Show daemon and queue status
-roborev status --json            # Structured status for scripting
+roborev status                   # Backward-compatible status alias
+roborev daemon status --json     # Structured status for scripting
 
 roborev post-commit              # Hook entry point (called by git hook)
 roborev install-hook             # Install post-commit hook
@@ -754,14 +869,37 @@ roborev uninstall-hook           # Remove hook
 
 | Flag | Description |
 |------|-------------|
-| `--json` | Emit daemon and queue status as JSON. Includes the active daemon endpoint as `network`, `address`, and `port` fields alongside queue counters and version fields |
+| `--json` | Emit daemon, web UI, and queue status as JSON. Includes the canonical browser origin as `web_url` (with `web_disabled_reason` set to `config` or `missing-web-assets` when the browser listener is not running), active snoozes under `daemon.active_snoozes`, and the active daemon endpoint as `network`, `address`, and `port` fields alongside queue counters and version fields |
 | `--force` | Overwrite an existing post-commit hook with a fresh one |
+
+`roborev daemon start`, `roborev daemon restart`, and `roborev daemon status`
+print the canonical browser URL. If the running daemon has no browser listener,
+they explain why when the daemon published a reason —
+`Web UI: disabled (this build has no embedded web assets; reinstall from an official release)`
+or `Web UI: disabled ([web] enabled = false)` — and print `Web UI: unavailable`
+otherwise, instead of silently omitting the application. The older
+`roborev status` command remains an alias with identical output.
+
+When Agent Hook reminders are snoozed, `roborev daemon status` lists every
+active scope with its repository, exact worktree, branch, and local expiry time.
+The section is omitted when no snoozes are active. JSON output exposes the same
+records under `daemon.active_snoozes`.
+
+If daemon access is denied, `roborev daemon status` reports the status as
+unavailable and suggests allowing loopback or Unix-socket access when running in
+a sandbox. It does not treat permission denial as proof that the daemon is
+stopped, and it does not start or restart the daemon. JSON output keeps
+`running: true` and includes the access error.
 
 `pause` and `unpause` are daemon-wide queue controls. Pausing prevents workers
 from starting new queued jobs, but running jobs continue to completion. A paused
-queue survives daemon restarts and is shown in `roborev status` and the TUI. Use
-`cancel` when you need to stop one queued or running job instead of pausing the
-whole queue.
+queue survives daemon restarts and is shown in `roborev daemon status` and the
+TUI. Use `cancel` when you need to stop one queued or running job instead of
+pausing the whole queue.
+
+Daemon shutdown also stops workers from claiming new jobs. If work is active,
+restart reports that it is waiting, lets running jobs and worker finalization
+finish without a timeout, and only then starts the replacement daemon.
 
 !!! tip "Broken post-commit hook?"
 
@@ -807,43 +945,44 @@ See: [Configuration](/configuration/#post-commit-review-mode)
 ## Agent Hook
 
 ```bash
-roborev agent-hook install              # Install Codex + Claude hook entries
-roborev agent-hook install --agent codex --dry-run   # Preview one harness
+roborev agent-hook install              # Install profiles for detected agents
+roborev agent-hook install --agent all  # Install all nine integrations
+roborev agent-hook install --agent hermes --config ~/.hermes/config.yaml
 roborev agent-hook install --binary ~/.local/bin/roborev
-roborev agent-hook dump --agent claude  # Print hook config JSON (declarative setups)
-roborev agent-hook run                  # Read a hook payload from stdin (harness calls this)
+roborev agent-hook dump --agent qwen    # Native JSON config on stdout
+roborev agent-hook dump --agent hermes  # Native YAML config on stdout
+roborev agent-hook run --agent cursor   # Harness runtime; --agent is required
 roborev agent-hook status               # Tracked session counters as JSON
 roborev agent-hook reset <session-id>   # Reset one session (or --all)
-roborev agent-hook daemon start         # start | status | stop | restart
 ```
 
 | Flag | Description |
 |------|-------------|
-| `--agent <name>` | Target harness: `codex`, `claude`, `droid`, or `all` (`all` for `install` only) |
+| `--agent <name>` | `claude`, `codex`, `copilot`, `cursor`, `droid`, `gemini`, `hermes`, `qwen`, `grok`, or `all` for install |
 | `--dry-run` | Report whether each target needs changes without writing (`install`) |
-| `--command <cmd>` | Override the installed hook command (default: resolved roborev binary + `agent-hook run`) |
+| `--config <path>` | Override the native config path for one explicit profile |
+| `--command <cmd>` | Override the full command for one explicit profile; it must select the same agent |
 | `--binary <path>` | Resolve and bake this roborev binary path into installed agent hooks. Mutually exclusive with `--command` |
-| `--scope user` | Factory Droid config scope (`--agent droid` only) |
 
-`roborev agent-hook` is an opt-in Codex, Claude Code, and Factory Droid
-integration that prompts the agent to run the fix skill when review work piles
-up. See [Agent Hook](/agent-hook/).
+The default install detects agents by executable or existing config directory;
+`--agent all` skips detection. Factory Droid remains user-scoped and rejects
+project `.factory/hooks.json` paths. Hermes queues post-tool reminders for a
+later `Stop`. Cursor records the same events as other profiles but emits no
+control response.
 
-```bash
-roborev agent-hook install --agent droid             # Install Factory Droid hook entries (user scope)
-roborev agent-hook install --agent droid --binary ~/.local/bin/roborev
-roborev agent-hook dump --agent droid --scope user   # Print hook config JSON (declarative setups)
-roborev agent-hook run --agent droid                 # Read a hook payload from stdin (Droid calls this)
-roborev agent-hook status                            # Tracked session counters as JSON (shared daemon)
-roborev agent-hook reset <session-id>                # Reset one session (or --all)
-```
+If the old release provides `roborev agent-hook daemon`, run that release's
+`roborev agent-hook daemon stop` before installing or starting the new release.
+The new release uses only the regular roborev daemon and does not take over an
+old auxiliary process.
 
-Use `--agent droid` to install Factory Droid hook entries that prompt Droid to
-run `/roborev-fix` when review work piles up, sharing the same local state
-daemon. The Droid profile installs to user scope by default
-(`~/.factory/hooks.json`); roborev does not install project-scoped Factory hooks
-because `.factory/hooks.json` is executable repo-local configuration. See
-[Agent Hook](/agent-hook/).
+After upgrading existing hooks, run `roborev agent-hook install` once. It
+replaces recognizable Codex, Claude, and Factory Droid registrations from the
+previous installer with profile-bearing commands while preserving unrelated
+hooks. Replace `--codex-config` or `--claude-config` with
+`--agent NAME --config PATH`; remove `--scope user`.
+
+See [Agent Hook](/agent-hook/) for profile detection, threshold configuration,
+the fallback fix workflow, and declarative config details.
 
 ## Checking Agents
 
@@ -857,6 +996,9 @@ roborev check-agents --timeout 30   # Set timeout per agent (seconds)
 |------|-------------|
 | `--agent <name>` | Test only this agent |
 | `--timeout <secs>` | Timeout per agent (default: 60) |
+
+Health checks honor configured `*_cmd` overrides, so they test the same binary
+or wrapper that roborev uses for review and agentic jobs.
 
 ## Agent Skills
 
@@ -899,6 +1041,62 @@ These flags work across most commands:
 ## Update
 
 ```bash
-roborev update                   # Update to latest version
-roborev update --force           # Force update (useful for dev builds)
+roborev update                       # Update to latest version
+roborev update --force               # Replace a development build
+roborev update --running=wait        # Finish active reviews first
+roborev update --running=interrupt   # Requeue active attempts, then update
+roborev update --running=abort       # Update only when no reviews are active
+roborev update --no-restart          # Install without daemon coordination
 ```
+
+The updater coordinates daemon replacement with the review queue:
+
+- `--running=wait` prevents new reviews from starting and waits for active
+    reviews to finish.
+- `--running=interrupt` cleanly stops active attempts and requeues them without
+    consuming a retry.
+- `--running=abort` updates only when the daemon atomically confirms that no
+    reviews are running. A busy result exits nonzero.
+- Without `--running`, interactive updates prompt when reviews are active.
+    `--yes` defaults to `wait`.
+- `--no-restart` skips daemon preparation, restart, hook repair, and skill
+    updates.
+
+When an interactive update finds active reviews, it asks once:
+
+```text
+3 reviews are currently running.
+
+  [w] Wait for them to finish, then update
+  [u] Update now; interrupt and restart them automatically
+  [a] Abort
+
+Choice [a]:
+```
+
+The daemon continues accepting enqueues during an update drain but does not
+claim them until the replacement daemon is ready. A user cancellation remains
+terminal. An update interruption starts a fresh attempt and discards the partial
+attempt log. Non-interactive waits have no updater-specific deadline; they are
+bounded by the configured job timeout (30 minutes by default).
+
+Successful updates use a compact phase summary. The final success line appears
+only after the replacement daemon is responsive and reports the installed
+version:
+
+```text
+Downloading  100% (20.3 MB)
+Installing   done
+Daemon       restarted (v0.65.0)
+Git hooks    done
+Skills       done
+
+Updated roborev to v0.65.0
+```
+
+If no daemon is running initially, the updater checks again before and after
+installation so a daemon started concurrently is still drained, restarted, and
+version-verified. The daemon phase says `not running` only when both checks stay
+empty. Pressing Ctrl-C before installation releases the update drain. Pressing
+it after installation exits nonzero and tells you to run
+`roborev daemon restart` rather than claiming the update completed.

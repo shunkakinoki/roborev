@@ -29,3 +29,13 @@ type RegisterRepoBody = RegisterRepoRequest
 type CloseReviewBody = CloseReviewRequest
 
 type BackfillTokensBody = BackfillTokensRequest
+
+type BootstrapWebSessionBody = WebBootstrapInputBody
+
+type LoginWebSessionBody = WebLoginRequest
+
+type PrepareUpdateBody = UpdateDrainRequestBody
+
+type ReleaseUpdateBody = UpdateLeaseRequestBody
+
+type RenewUpdateBody = UpdateLeaseRequestBody

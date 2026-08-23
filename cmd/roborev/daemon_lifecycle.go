@@ -32,28 +32,32 @@ var (
 
 	// Update daemon restart controls - exposed for testing. The wait must
 	// absorb slow Windows cold starts (antivirus rescans a freshly updated
-	// binary) without falling into the force-kill path.
+	// binary) before reporting that manual intervention is needed.
 	updateRestartWaitTimeout  = 10 * time.Second
 	updateRestartPollInterval = 200 * time.Millisecond
 
 	// Probe retry controls for ensureDaemon - exposed for testing. A single
-	// failed probe must not trigger a destructive kill-and-restart: the
+	// failed probe must not trigger an unnecessary restart: the
 	// daemon may be mid-startup or briefly too busy to answer.
 	ensureProbeAttempts   = 3
 	ensureProbeRetryDelay = 1 * time.Second
+	probeDaemonForEnsure  = probeDaemonWithRetry
 
 	// daemonStartTimeout bounds how long startDaemon waits for a spawned
 	// daemon to become ready.
-	daemonStartTimeout      = 15 * time.Second
-	getAnyRunningDaemon     = daemon.GetAnyRunningDaemon
-	listAllRuntimes         = daemon.ListAllRuntimes
-	cleanupZombieDaemons    = daemon.CleanupZombieDaemons
-	isPIDAliveForUpdate     = isPIDAliveForUpdateDefault
-	restartDaemonForEnsure  = restartDaemon
-	startDaemonForEnsure    = startDaemon
-	stopDaemonForUpdate     = stopDaemon
-	killAllDaemonsForUpdate = killAllDaemons
-	startUpdatedDaemon      = func(binDir string) error {
+	daemonStartTimeout          = 15 * time.Second
+	getAnyRunningDaemon         = daemon.GetAnyRunningDaemon
+	getAnyRunningDaemonForStart = daemon.GetAnyRunningDaemonContext
+	listAllRuntimes             = daemon.ListAllRuntimes
+	cleanupZombieDaemons        = daemon.CleanupZombieDaemons
+	isPIDAliveForUpdate         = isPIDAliveForUpdateDefault
+	restartDaemonForEnsure      = restartDaemon
+	startDaemonForEnsure        = startDaemon
+	startDaemonDetached         = startDetachedDaemon
+	stopDaemonForRestart        = stopDaemon
+	startDaemonAfterRestart     = startDaemon
+	stopDaemonForUpdate         = stopDaemon
+	startUpdatedDaemon          = func(binDir string) error {
 		newBinary := filepath.Join(binDir, "roborev")
 		if runtime.GOOS == "windows" {
 			newBinary += ".exe"
@@ -76,6 +80,8 @@ var (
 		return sigCh, func() { signal.Stop(sigCh) }
 	}
 )
+
+var errDaemonReady = errors.New("daemon ready")
 
 // ErrDaemonNotRunning indicates no daemon runtime file was found
 var ErrDaemonNotRunning = fmt.Errorf("daemon not running (no runtime file found)")
@@ -189,8 +195,7 @@ func isTransportError(err error) bool {
 		return false
 	}
 	// Check if the underlying error is a net-level transport failure
-	var opErr *net.OpError
-	if errors.As(urlErr.Err, &opErr) {
+	if _, ok := errors.AsType[*net.OpError](urlErr.Err); ok {
 		return true
 	}
 	// Also catch net.Error (timeout interface) that isn't wrapped in OpError
@@ -226,10 +231,17 @@ func ensureDaemon() error {
 	skipVersionCheck := os.Getenv("ROBOREV_SKIP_VERSION_CHECK") == "1"
 
 	// First check runtime files for any running daemon
-	if info, err := getAnyRunningDaemon(); err == nil {
+	info, discoveryErr := getAnyRunningDaemon()
+	if daemon.IsDaemonAccessDenied(discoveryErr) {
+		return discoveryErr
+	}
+	if discoveryErr == nil {
 		if !skipVersionCheck {
-			probe, err := probeDaemonWithRetry(info.Endpoint(), 2*time.Second)
+			probe, err := probeDaemonForEnsure(info.Endpoint(), 2*time.Second)
 			if err != nil {
+				if daemon.IsDaemonAccessDenied(err) {
+					return fmt.Errorf("%w: %w", daemon.ErrDaemonAccessDenied, err)
+				}
 				if verbose {
 					fmt.Printf("Daemon probe failed, restarting...\n")
 				}
@@ -256,7 +268,8 @@ func ensureDaemon() error {
 	// Try the configured default address for manual daemon runs that do not
 	// have a runtime file yet.
 	ep := getDaemonEndpoint()
-	if probe, err := daemon.ProbeDaemon(ep, 2*time.Second); err == nil {
+	probe, probeErr := probeDaemonForEnsure(ep, 2*time.Second)
+	if probeErr == nil {
 		if !skipVersionCheck {
 			if probe.Version == "" {
 				if verbose {
@@ -272,6 +285,9 @@ func ensureDaemon() error {
 			}
 		}
 		return nil
+	}
+	if daemon.IsDaemonAccessDenied(probeErr) {
+		return fmt.Errorf("%w: %w", daemon.ErrDaemonAccessDenied, probeErr)
 	}
 
 	// Legacy pre-kit daemons are invisible to kit discovery because they do
@@ -300,6 +316,14 @@ func startDaemon() error {
 		Store:    daemon.RuntimeStore(),
 		Discover: daemon.DiscoverOptions(1 * time.Second),
 		Start: func(ctx context.Context) error {
+			ready, err := discoverDaemonForStart(ctx)
+			if err != nil {
+				return err
+			}
+			if ready {
+				return errDaemonReady
+			}
+
 			exe, err := os.Executable()
 			if err != nil {
 				return fmt.Errorf("failed to find executable: %w", err)
@@ -309,20 +333,51 @@ func startDaemon() error {
 				return err
 			}
 			defer closeLogs()
-			return startDetachedDaemon(ctx, detachedDaemonOptions{
+			if err := startDaemonDetached(ctx, detachedDaemonOptions{
 				Executable:      exe,
 				Args:            []string{"daemon", "run"},
 				Env:             filterGitEnv(os.Environ()),
 				Stdout:          stdout,
 				Stderr:          stderr,
 				RefuseEphemeral: os.Getenv("ROBOREV_TEST_ALLOW_AUTOSTART") != "1",
-			})
+			}); err != nil {
+				return err
+			}
+
+			for {
+				ready, err := discoverDaemonForStart(ctx)
+				if err != nil {
+					return err
+				}
+				if ready {
+					return errDaemonReady
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(50 * time.Millisecond):
+				}
+			}
 		},
 	}
 	if _, _, err := manager.Ensure(context.Background(), daemonStartTimeout); err != nil {
+		if errors.Is(err, errDaemonReady) {
+			return nil
+		}
 		return fmt.Errorf("failed to start daemon: %w", err)
 	}
 	return nil
+}
+
+func discoverDaemonForStart(ctx context.Context) (bool, error) {
+	_, err := getAnyRunningDaemonForStart(ctx)
+	if err == nil {
+		return true, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	return false, nil
 }
 
 func openDetachedDaemonLogs() (*os.File, *os.File, func(), error) {
@@ -365,6 +420,10 @@ func stopDaemon() error {
 	// Kill all found daemons, track failures
 	var lastErr error
 	for _, info := range runtimes {
+		fmt.Fprintln(
+			os.Stderr,
+			"Waiting for daemon shutdown; no new reviews will start, and any running reviews will finish first...",
+		)
 		if !daemon.KillDaemon(info) {
 			lastErr = fmt.Errorf("failed to kill daemon (pid %d)", info.PID)
 		}
@@ -373,18 +432,12 @@ func stopDaemon() error {
 	return lastErr
 }
 
-// killAllDaemons kills any roborev daemon processes that might be running
-// This handles orphaned processes from old binaries or crashed restarts
-func killAllDaemons() {
-	killAllDaemonsPlatform()
-	time.Sleep(200 * time.Millisecond)
-}
-
 // restartDaemon stops the running daemon and starts a new one
 func restartDaemon() error {
-	_ = stopDaemon() // Ignore error - killAllDaemons is the fallback
-	// Also kill any orphaned daemon processes from old binaries
-	killAllDaemons()
+	if err := stopDaemonForRestart(); err != nil &&
+		!errors.Is(err, ErrDaemonNotRunning) {
+		return err
+	}
 
 	// Checkpoint WAL to ensure clean state for new daemon
 	// Retry a few times in case daemon hasn't fully released the DB
@@ -412,5 +465,5 @@ func restartDaemon() error {
 		}
 	}
 
-	return startDaemon()
+	return startDaemonAfterRestart()
 }

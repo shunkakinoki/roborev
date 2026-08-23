@@ -138,7 +138,7 @@ Use --all-branches to discover and refine all branches with failed reviews.`,
 
 	cmd.Flags().StringVar(&opts.agentName, "agent", "", "agent to use for addressing findings (default: from config)")
 	cmd.Flags().StringVar(&opts.model, "model", "", "model for agent (format varies: opencode uses provider/model, others use model name)")
-	cmd.Flags().StringVar(&opts.reasoning, "reasoning", "", "reasoning level: fast, standard (default), medium, thorough, or maximum")
+	cmd.Flags().StringVar(&opts.reasoning, "reasoning", "", "reasoning level: legacy presets fast, standard (default), thorough, maximum; exact tiers low, medium, high, xhigh, max")
 	cmd.Flags().StringVar(&opts.minSeverity, "min-severity", "", "minimum finding severity to address: critical, high, medium, or low")
 	cmd.Flags().BoolVar(&fast, "fast", false, "shorthand for --reasoning fast")
 	cmd.Flags().IntVar(&opts.maxIterations, "max-iterations", 10, "maximum refinement iterations")
@@ -291,8 +291,7 @@ func validateRefineContext(
 			// upstream/main in a fork). A branch tracking its own remote
 			// counterpart is not trunk — use GetDefaultBranch instead.
 			upstream, uerr := git.GetUpstream(repoPath, "HEAD")
-			var missing *git.UpstreamMissingError
-			if errors.As(uerr, &missing) {
+			if missing, ok := errors.AsType[*git.UpstreamMissingError](uerr); ok {
 				return "", "", "", "",
 					fmt.Errorf(
 						"%w (run 'git fetch' or pass --since)", missing,
@@ -632,7 +631,11 @@ func runRefine(runCtx RunContext, opts refineOptions) error {
 		if opts.quiet {
 			agentOutput = io.Discard
 		} else {
-			fmtr = streamfmt.New(os.Stdout, isTerminal(os.Stdout.Fd()))
+			fmtr = streamfmt.New(
+				os.Stdout,
+				isTerminal(os.Stdout.Fd()),
+				streamfmt.DecoderForAgent(addressAgent.Name()),
+			)
 			agentOutput = fmtr
 		}
 
@@ -1509,8 +1512,7 @@ func isInitializedRefineSubmodule(ctx context.Context, repoPath, path string) (b
 	cmd := refineGitCmd(ctx, "-C", submodulePath, "rev-parse", "--show-toplevel")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
+		if _, ok := errors.AsType[*exec.ExitError](err); ok {
 			return false, nil
 		}
 		return false, fmt.Errorf(

@@ -94,7 +94,8 @@ review_context_count = 5   # Recent reviews to include as context
 display_name = "backend"   # Custom name shown in TUI (optional)
 excluded_branches = ["wip", "scratch"]  # Branches to skip reviews on
 
-# Reasoning levels: thorough, standard, fast
+# Legacy levels: fast, standard, thorough, maximum
+# Exact agent efforts: low, medium, high, xhigh, max
 review_reasoning = "thorough"  # For code reviews (default: thorough)
 refine_reasoning = "standard"  # For refine command (default: standard)
 
@@ -135,8 +136,8 @@ max_chars = 50000
 | `post_commit_review` | string | Post-commit hook behavior: `"commit"` (default) or `"branch"` |
 | `hook_timeout_seconds` | int | Override the post-commit hook request timeout for this repo, in seconds. Useful for large repos where the daemon's enqueue git calls are slow. Read filesystem-only from this checkout's `.roborev.toml` (a linked worktree without its own file does not inherit the main checkout's value). Zero or negative values inherit the global / platform default |
 | `auto_close_passing_reviews` | bool | Automatically close reviews that pass with no findings |
-| `review_reasoning` | string | Reasoning level for reviews: thorough, standard, fast |
-| `refine_reasoning` | string | Reasoning level for refine: thorough, standard, fast |
+| `review_reasoning` | string | Reasoning level for reviews. See [Reasoning Levels](#reasoning-levels) |
+| `refine_reasoning` | string | Reasoning level for refine. See [Reasoning Levels](#reasoning-levels) |
 | `review_min_severity` | string | Minimum severity for reviews: `critical`, `high`, `medium`, or `low`. Cascades: CLI flag > repo config > global config |
 | `fix_min_severity` | string | Minimum severity for `fix`: `critical`, `high`, `medium`, or `low` |
 | `refine_min_severity` | string | Minimum severity for `refine`: `critical`, `high`, `medium`, or `low` |
@@ -215,6 +216,34 @@ environment running `roborev`.
 `fix_commit_co_authored_by` uses `git commit --trailer`, which requires Git 2.32
 or newer. `fix_commit_author` uses Git's long-standing `--author` option and is
 not gated on trailer support.
+
+### Fix Guidelines
+
+Use the global-only `fix_guidelines` setting to tell Agent Hook and foreground
+`roborev fix` agents how to evaluate review findings instead of blindly applying
+every suggestion:
+
+```toml
+# ~/.roborev/config.toml
+fix_guidelines = """
+Treat review findings as hypotheses. Verify each one against the code and
+project requirements. Explain findings that are intentionally not applied.
+"""
+```
+
+The value applies to direct fixes, batch fixes, and commit retries. It also
+appears at the end of triggered reminders for every Agent Hook profile. Missing
+or empty guidance preserves the existing automatic behavior. With guidance
+configured, direct `roborev fix` runs record whether changes were applied and
+preserve the agent's final explanation before closing each review. Batch runs
+record a neutral batch outcome, while the agent report gives every job ID a
+fixed or skipped disposition.
+
+This key is not accepted in `.roborev.toml` and has no CLI or environment
+override. Agent Hook's `--config` option still controls profile thresholds and
+the full-replacement `instruction`, but it does not redirect `fix_guidelines`
+away from the standard global config. `roborev analyze --fix` and
+`roborev refine` keep their existing, separate prompt behavior.
 
 ### Review Guidelines
 
@@ -381,7 +410,22 @@ reasoning level:
 
 - `{workflow}_model_{level}` or `{workflow}_agent_{level}`
 - `workflow` is `review`, `refine`, `fix`, `security`, or `design`
-- `level` is `thorough`, `standard`, or `fast`
+- `level` is a legacy or exact value from [Reasoning Levels](#reasoning-levels)
+
+For compatibility, exact `low`, `high`, `xhigh`, and `max` routing falls back to
+the corresponding `fast`, `thorough`, or `maximum` key when an exact key is not
+configured.
+
+Agent and model keys fall back independently. Use the same naming family for
+both halves of a level-specific route: keep an existing legacy pair together, or
+migrate both keys to exact names. For example, do not combine `review_agent_low`
+with `review_model_fast`; the model fallback could pass the legacy route's model
+to the exact route's agent. Prefer this form for new configuration:
+
+```toml
+review_agent_low = "codex"
+review_model_low = "gpt-5.6-terra"
+```
 
 The fallback hierarchy for each workflow is:
 
@@ -718,6 +762,13 @@ column_borders = true             # Show separators between TUI columns
 | `default_backup_model` | string | - | Model paired with `default_backup_agent` | Yes |
 | `default_model` | string | agent default | Model to use (format varies by agent) | Yes |
 | `server_addr` | string | 127.0.0.1:7373 | Daemon listen address. Use `unix://` for Unix domain socket (see [Unix Domain Socket](#unix-domain-socket)) | No |
+| `web.enabled` | bool | true | Serve the embedded browser application on a separate listener | No |
+| `web.listen` | string | 127.0.0.1:0 | Loopback browser listener address. Port 0 selects an available ephemeral port | No |
+| `web.public_origin` | string | - | Exact HTTPS origin exposed by a reverse proxy | No |
+| `web.base_path` | string | - | Optional canonical routing prefix, without a trailing slash; not a same-origin security boundary | No |
+| `web.auth_mode` | string | - | Browser admission mode; set `proxy` to delegate admission to an external access boundary | No |
+| `web.auth_token` | string | - | Base64url-encoded 32-byte random token exchanged for a process-local browser session | No |
+| `web.auth_token_file` | string | - | Host-local file containing the browser token; mutually exclusive with `web.auth_token` | No |
 | `max_workers` | int | 4 | Number of parallel review workers | No |
 | `job_timeout_minutes` | int | 30 | Per-job timeout in minutes | Yes |
 | `hook_timeout_seconds` | int | `3` (`30` on Windows) | Post-commit hook request timeout, in seconds. Raise it on Windows or large repos where the daemon's enqueue git calls are slow. Zero or negative values are ignored and fall back to the platform default | Yes |
@@ -765,8 +816,99 @@ column_borders = true             # Show separators between TUI columns
 The daemon automatically watches `~/.roborev/config.toml` for changes. Most
 settings take effect immediately without restarting the daemon.
 
-**Settings that require daemon restart:** `server_addr`, `max_workers`, and the
-`[sync]` section.
+**Settings that require daemon restart:** `server_addr`, `max_workers`, the
+`[web]` section, and the `[sync]` section.
+
+### Browser Application
+
+Roborev serves its embedded browser application from a listener separate from
+the loopback CLI API. Local browser access works without additional
+configuration: `roborev ui` starts the daemon when needed and opens the
+runtime-advertised browser origin.
+
+To expose that listener through an HTTPS reverse proxy, keep the daemon-side
+listener on loopback and configure an exact public origin. Roborev can either
+authenticate browsers with its own token or delegate admission to the proxy and
+private network.
+
+For Roborev token authentication, generate a compatible base64url value with:
+
+```bash
+openssl rand -base64 32 | tr '+/' '-_' | tr -d '='
+```
+
+Paste that command's output as `auth_token`:
+
+```toml
+[web]
+enabled = true
+listen = "127.0.0.1:7374"
+public_origin = "https://reviews.example.com"
+base_path = "/reviews"
+auth_token_file = "/etc/roborev/web-auth-token"
+```
+
+`public_origin` must be an exact scheme-and-authority origin with no path. Set
+`base_path` separately when the proxy mounts the browser application below a URL
+prefix; it must start with `/`, have no trailing slash, query, fragment, percent
+escape, backslash, control character, surrounding whitespace, or path traversal.
+The token file must contain exactly one base64url-encoded 32-byte token,
+optionally followed by one terminal newline. It is mutually exclusive with
+`auth_token` and is read when the daemon starts, so the token bytes do not need
+to be stored in the configuration file.
+
+To use the reverse proxy or private network as the admission boundary instead,
+configure proxy authentication and omit both token settings:
+
+```toml
+[web]
+enabled = true
+listen = "127.0.0.1:7374"
+public_origin = "https://reviews.example.com"
+base_path = "/reviews"
+auth_mode = "proxy"
+```
+
+Proxy mode is explicit and requires an exact HTTPS `public_origin`. Roborev
+automatically creates its normal process-local browser session after validating
+the public Host, exact Origin, same-origin browser fetch metadata, and
+forwarding request shape. Proxy sessions keep the restricted remote-user
+capabilities and all mutation requests still require the tab-scoped CSRF
+credential. Unknown auth modes and proxy configurations containing either token
+setting fail before the listener starts.
+
+The proxy must preserve the public `Host`, set conventional forwarding headers,
+and avoid buffering `/api/stream/events` and streamed `/api/job/output`
+responses. The public origin must match the browser origin exactly and must use
+HTTPS for remote access. Roborev rejects non-loopback browser listener addresses
+so credentials are never sent over a plaintext network hop. The CLI API remains
+private on its original listener.
+
+The browser session cookie uses `/` when `base_path` is empty and
+`base_path + "/"` when a prefix is configured. That path scope reduces
+incidental cookie transmission, but it is not an authorization boundary: scripts
+on the same origin can still make requests below the prefix. `base_path`
+provides routing only. Token deployments should use a dedicated origin. Proxy
+deployments must trust every application served from the configured origin; use
+a dedicated origin when that is not true.
+
+In token mode, the browser exchanges the daemon token for an HTTP-only cookie
+and tab-scoped credentials. The token is entered after the public shell opens
+and is never retained by the application. Every daemon restart requires the
+token again, including from the daemon host. Invalid logins trigger a
+process-wide exponential cooldown. A valid token bypasses that cooldown and
+resets the failure count immediately. In proxy mode, successful same-origin
+bootstrap creates those credentials automatically; a stale cookie after restart
+is replaced without displaying the token prompt.
+
+The shell itself is public so a cross-site deep link can load while the session
+cookie uses `SameSite=Strict`. Its subsequent same-origin bootstrap request
+receives the cookie and creates credentials stored only for that tab. Disable
+the listener with `web.enabled = false`; in that mode, `roborev ui` reports that
+browser access needs to be configured instead of opening a dead URL.
+
+See [Browser UI](/web-ui/) for the exact installed-user workflow, a Tailscale
+Serve recipe, browser-session behavior, and the analytics metric definitions.
 
 ### Data Directory
 
@@ -793,6 +935,14 @@ On Unix systems, the daemon can listen on a Unix domain socket instead of TCP
 loopback. This provides filesystem-level access control: the socket is created
 with `0600` permissions and its parent directory with `0700`, so only the owning
 user can connect.
+
+The default TCP daemon also tries to expose this private socket as an alternate
+endpoint. Clients can fall back to it when a sandbox blocks TCP loopback. This
+alternate is best-effort: if the socket cannot be created, the daemon warns and
+continues serving TCP. Its path is namespaced by the configured data directory
+and advertised through daemon runtime metadata, so isolated daemons do not
+replace one another's fallback. An explicit `server_addr = "unix://"`
+configuration remains socket-only.
 
 To enable Unix domain sockets, set `server_addr` to `unix://`:
 
@@ -1009,6 +1159,16 @@ with the agent session ID. If `endpoint` is empty, roborev uses the `agentsview`
 CLI path. `timeout` defaults to `10s`; invalid, zero, or negative values also
 fall back to `10s`.
 
+Usage indexing can lag behind job completion. The daemon retries fresh misses
+and periodically revisits terminal jobs from the past week that still lack a
+recorded price. The missing price in SQLite is the durable retry state, so
+reconciliation resumes after daemon restarts. For rows without a stored session
+ID, the daemon recovers the ID and token counts from the per-job JSONL log
+before retrying the provider. Provider failures do not change the completed job
+result. Deleted sessions and sessions reused by multiple started jobs can remain
+unpriced; jobs older than the one-week scan window are reachable with
+`roborev backfill-tokens`.
+
 The endpoint should return JSON compatible with
 `agentsview session usage --format json`:
 
@@ -1161,6 +1321,30 @@ and so locked-down environments do not need to fetch it at runtime:
 ```bash
 pi install npm:@nqbao/pi-json-schema
 ```
+
+Additional Pi CLI arguments can be prepended to every Pi invocation with
+`launch_args`. Each array entry is passed as one argument without shell parsing.
+Roborev appends its managed arguments afterward so its workflow and safety
+settings retain precedence for well-formed duplicate options.
+
+```toml
+[agent.pi]
+launch_args = [
+  "--extension",
+  "npm:@example/pi-provider",
+]
+```
+
+This is useful when a model provider is registered by an extension. Classifier
+jobs retain `--no-extensions`, but Pi still loads extensions named explicitly
+with `--extension`. The same launch arguments are also passed to normal reviews
+and agentic Pi runs.
+
+`launch_args` is an advanced raw-argument escape hatch, not a validation or
+security boundary. Parser-control tokens such as standalone `--`, early-exit
+flags, and options missing required values are unsupported and may prevent Pi
+from running the managed invocation. Roborev cannot validate every argument
+because Pi extensions may define their own flags and value requirements.
 
 ## Hooks
 
@@ -1328,7 +1512,7 @@ to a design-review job or marks it skipped accordingly.
 |--------|------|---------|-------------|
 | `classify_agent` | string | `claude-code` | Agent for the routing classifier. Must implement structured-output (`SchemaAgent`) capability |
 | `classify_model` | string | agent default | Model for the classifier agent |
-| `classify_reasoning` | string | `fast` | Reasoning level: `fast`, `standard`, `medium`, `thorough`, or `maximum` |
+| `classify_reasoning` | string | `fast` | Legacy or exact value from [Reasoning Levels](#reasoning-levels) |
 | `classify_backup_agent` | string | - | Fallback classifier agent on quota exhaustion or failure |
 | `classify_backup_model` | string | - | Fallback classifier model |
 
@@ -1367,25 +1551,54 @@ when the feature is disabled across all repos.
 
 ## Reasoning Levels
 
-Reasoning levels control how deeply the AI analyzes code.
+Reasoning levels control how deeply the AI analyzes code. The exact values
+`low`, `medium`, `high`, `xhigh`, and `max` request the same-named native effort
+from agents that support it. An unsupported exact tier is left unset rather than
+collapsed into a different tier. Prefer exact values for new CLI invocations and
+configuration. The legacy presets remain accepted for compatibility.
 
-| Level | Description | Best For |
-|-------|-------------|----------|
-| `maximum` | Deepest analysis; maps to Codex `xhigh` reasoning | Complex reviews requiring maximum depth |
-| `thorough` | Deep analysis with extended thinking | Code reviews (default) |
-| `standard` | Balanced analysis | Refine command (default) |
-| `fast` | Quick responses | Rapid feedback |
+Use this table when moving from legacy presets to exact tiers. These are the
+closest matches in intent, not universal aliases: legacy presets retain their
+agent-specific behavior.
 
-`maximum` is accepted as `max` or `xhigh` on the command line. For agents
-without an xhigh equivalent (Droid, Kilo, Pi), it maps to their highest
-available level (same as thorough).
+| Legacy preset | Preferred exact tier | Difference to consider |
+|---------------|----------------------|------------------------|
+| `fast` | `low` | Kilo's legacy preset uses `minimal`; exact `low` requests `low` |
+| `standard` | `medium` | Legacy `standard` usually leaves the agent's default unchanged; exact `medium` requests `medium` |
+| `thorough` | `high` | Current reasoning-capable agents map the legacy preset to `high` |
+| `maximum` | `xhigh` or `max` | The legacy ceiling varies by agent and Codex model; choose the exact tier deliberately |
+
+The legacy values keep their established per-agent behavior:
+
+| Legacy value | Codex | Claude | Grok | Droid | Kilo | Pi |
+|--------------|-------|--------|------|-------|------|----|
+| `fast` | `low` | `low` | `low` | `low` | `minimal` | `low` |
+| `standard` | default | default | default | default | default | `medium` |
+| `thorough` | `high` | `high` | `high` | `high` | `high` | `high` |
+| `maximum` | GPT-5.6 `sol`/`terra`/`luna`: `max`; otherwise `xhigh` | `max` | `max` | `high` | `high` | `high` |
+
+Native support is agent-specific. Codex, Claude, Grok, and Pi accept all five
+exact values. Droid accepts `low`, `medium`, and `high`. Kilo passes exact
+values through as model variants, so availability depends on the selected
+provider and model. Agents without a reasoning flag ignore the level while
+workflow-specific agent and model routing still uses its exact name.
+
+For Codex, the legacy `maximum` preset requests literal `max` only when the
+selected model is explicitly `gpt-5.6-sol`, `gpt-5.6-terra`, or `gpt-5.6-luna`.
+Older, default, and unknown models keep the compatible `xhigh` mapping. Use the
+exact `xhigh` value to request `xhigh` on every Codex model, including GPT-5.6.
 
 Set per-command with `--reasoning`, or per-repo in `.roborev.toml`:
 
 ```bash
-roborev review --reasoning fast      # Quick review
-roborev refine --reasoning thorough  # Careful fixes
+roborev review --reasoning low    # Exact native low effort
+roborev refine --reasoning high   # Exact native high effort
+roborev review --reasoning xhigh  # Exact native xhigh effort
 ```
+
+The legacy `--reasoning fast`, `standard`, `thorough`, and `maximum` values and
+the `--fast` shorthand continue to work. Avoid mixing legacy and exact suffixes
+between matching agent and model configuration keys.
 
 ## Authentication
 

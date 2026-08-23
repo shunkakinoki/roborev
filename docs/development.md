@@ -20,8 +20,11 @@ only).
 ```
 roborev/
 ├── cmd/roborev/         # CLI entry point
+├── web/                  # Native Svelte browser application
+├── packages/             # Source-shipping browser component packages
 ├── internal/
 │   ├── daemon/          # HTTP API server and worker pool
+│   ├── web/             # Embedded, validated browser distribution
 │   ├── storage/         # SQLite operations
 │   ├── agent/           # Agent interface and implementations
 │   └── config/          # Configuration loading
@@ -32,14 +35,16 @@ roborev/
 ## Architecture
 
 ```
-CLI (roborev) -> HTTP API -> Daemon (roborev daemon run) -> Worker Pool -> Agents
-                                |
-                            SQLite DB
+CLI / Agent hooks -> HTTP API -> Daemon (roborev daemon run) -> Worker Pool -> Agents
+                                     |
+                                     +-> SQLite DB
+                                     +-> Agent Hook JSON state
 ```
 
 - **Daemon**: HTTP server on port 7373 (auto-finds available port if busy)
 - **Workers**: Pool of 4 (configurable) parallel review workers
 - **Storage**: SQLite at `~/.roborev/reviews.db` with WAL mode
+- **Agent Hook state**: JSON at `~/.roborev/agent-hook/state.json`
 
 ## Key Files
 
@@ -149,6 +154,59 @@ go build ./...             # Build all
 make install               # Install with version info
 ```
 
+Plain `go build` and `go install` source builds contain the compilation stub and
+therefore leave the browser listener disabled. `make build` and `make install`
+run the validated web-asset transaction when an embedded browser application is
+required. The Nix source build likewise provides the CLI and terminal UI only.
+
+### Browser application
+
+The browser workspace uses Bun 1.3.14. Install the pinned dependency graph and
+run its complete checks from the repository root:
+
+```bash
+bun install --frozen-lockfile
+bun run web:check
+bun run web:test
+bun run web:test:e2e
+make api-check
+make web-release-check
+```
+
+`make api-check` verifies that browser types match the canonical OpenAPI
+document. `make web-release-check` builds the SPA, validates its Vite manifest,
+temporarily stages it for Go embedding, tests the embedded release, and always
+restores the tracked compilation stub.
+
+To exercise a checkout exactly like an installed release, including the embedded
+application and the normal Roborev SQLite database and configuration, build the
+release-shaped binary and launch the UI through that binary:
+
+```bash
+bun install --frozen-lockfile
+make build
+./bin/roborev ui
+```
+
+This is intentionally different from `make web-dev`: it uses the normal Roborev
+data directory, starts or restarts the normal daemon as needed, and opens the
+reviews stored in the user's database. The binary remains under `bin/` and does
+not replace an installed `roborev`. Because this path runs the checkout against
+real state, use it only when that is the intended test.
+
+`bun run web:test:e2e` builds and embeds the production SPA into a scratch Go
+binary, seeds a synthetic SQLite database, starts a token-authenticated daemon
+with no workers, and runs the review and browser-security scenarios in Chromium.
+The runner uses a disposable home and data directory, restores the compilation
+stub, and removes all temporary state on success, failure, or interruption.
+
+Use `make web-dev` for full-stack development. It starts Vite and a branch-built
+daemon with a disposable data directory, SQLite database, and configuration; it
+never connects to the normal Roborev daemon or data directory. The runner
+allocates a Vite port first and supplies that exact loopback origin to the
+disposable daemon. There is no automatic development-origin relaxation. Stop the
+command to terminate both processes and remove the temporary data.
+
 ## Documentation
 
 The public docs site lives in `docs/` and is built with Zensical. The docs
@@ -157,7 +215,14 @@ branches before builds:
 
 - `docs-assets` contains curated static media such as logos, favicons, diagrams,
     Open Graph images, and integration screenshots.
-- `docs-generated-assets` contains generated CLI and TUI screenshots.
+- `docs-generated-assets` contains generated browser, CLI, and TUI screenshots.
+
+The screenshot pipeline reads the normal review database only through a
+read-only SQLite connection, extracts completed clean reviews from the canonical
+public Roborev repository, sanitizes copied content, and runs the branch binary
+against that reduced database inside Docker. See the
+[screenshot pipeline guide](https://github.com/kenn-io/roborev/blob/main/docs/screenshots/README.md)
+for the capture and asset publication workflow.
 
 Install the docs toolchain and build the site:
 

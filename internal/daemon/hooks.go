@@ -137,6 +137,9 @@ func (hr *HookRunner) Stop() {
 
 // handleEvent checks all configured hooks against the event and fires matches.
 func (hr *HookRunner) handleEvent(event Event) {
+	if event.SuppressHooks {
+		return
+	}
 	// Only handle review events
 	if !strings.HasPrefix(event.Type, "review.") {
 		return
@@ -403,8 +406,7 @@ func redactWebhookURL(raw string) string {
 // error, preventing Go's HTTP client from leaking the raw URL
 // (including secret path segments) in log output.
 func redactURLError(err error) error {
-	var ue *neturl.Error
-	if errors.As(err, &ue) {
+	if ue, ok := errors.AsType[*neturl.Error](err); ok {
 		return ue.Err
 	}
 	return err

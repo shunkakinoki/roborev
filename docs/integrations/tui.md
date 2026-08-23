@@ -60,6 +60,7 @@ branch.
 | `f` | Open filter (repo/branch tree) |
 | `b` | Open filter with branches expanded |
 | `h` | Toggle hide closed/failed/canceled |
+| `L` | Toggle split-screen or stacked layout |
 | `D` | Toggle distraction-free mode |
 | `P` | Pause or resume queue processing |
 | `g` | Jump to top of queue |
@@ -72,6 +73,30 @@ Panel reviews appear as one synthesis parent row by default. The parent row
 shows live progress while member reviewers run and a compact member summary
 after completion. Expand the row to inspect individual member jobs. Close,
 cancel, rerun, or fix the panel from the parent row, not from a member row.
+
+## Split-Screen Review
+
+At 140 columns by 36 rows or larger, the TUI automatically places the queue in a
+left pane and the selected job in a right detail pane. Moving through the queue
+updates the detail pane after a short debounce, so holding `j` or `k` does not
+issue a request for every intermediate row.
+
+The detail pane adapts to job state: completed jobs show the rendered review,
+running jobs show a live log tail, failed jobs show the error, and queued jobs
+show their metadata. When a running job finishes, its log is replaced by the
+review automatically.
+
+Press `Tab` to focus the detail pane and `Esc` to return to the queue. Review
+actions and scrolling work in the focused detail pane. `Enter` is intentionally
+a no-op while the split queue is focused because the detail already follows the
+selection. Mouse clicks focus either pane, and the wheel scrolls the pane below
+the pointer.
+
+Press `L` to lock the stacked or split preference for the TUI session. A split
+preference falls back to stacked when the terminal is too small and returns when
+it grows again. Prompt, comment, help, log, and task screens remain full-screen.
+The queue also drops lower-priority columns as needed to preserve the most
+useful fields in its narrower pane.
 
 ## Queue Pause
 
@@ -171,6 +196,10 @@ limited.
 The same compact layout activates automatically when the terminal height is
 below 15 rows.
 
+Distraction-free mode always uses the stacked single-column layout, even on
+terminals large enough for the split view; toggling it off restores the split
+view when the terminal fits.
+
 ## Column Customization
 
 Press `o` in the queue or tasks view to open the column options modal. From
@@ -192,6 +221,10 @@ The queue displays two separate status columns:
     Fail (red). This reflects whether the code review found issues, not whether
     the job itself errored. A job can finish successfully (Status = Done) with a
     Fail verdict if the reviewer flagged problems.
+
+For a commit review with no resolvable branch, the Branch column displays
+`(detached @ <shortsha>)` instead of an empty value. The label is display-only;
+branch filtering continues to group the review under `(none)`.
 
 The default-visible "Cost" column shows the model-pricing estimate from
 [agentsview](/commands/#token-usage) for jobs that have reported usage. The cell
@@ -416,7 +449,7 @@ read this file to discover running TUI instances.
 
 | Command | Description |
 |---------|-------------|
-| `get-state` | Current view, filters, hide-closed state, selected job ID, job counts |
+| `get-state` | Current view, filters, hide-closed state, selected job ID, job counts, layout, focus |
 | `get-filter` | Active repo and branch filters with lock status |
 | `get-jobs` | List of visible jobs (ID, agent, status, repo, branch, verdict) |
 | `get-selected` | Currently selected job and whether it has a review |
@@ -448,9 +481,13 @@ Send a request as a single JSON line:
 Responses include an `ok` field, optional `error`, and optional `data`:
 
 ```json
-{"ok": true, "data": {"view": "queue", "job_count": 15, ...}}
+{"ok": true, "data": {"view": "queue", "job_count": 15, "layout": "split", "focus": "list", ...}}
 {"ok": false, "error": "job not found"}
 ```
+
+The `get-state` response's `layout` field is always `"stacked"` or `"split"`.
+`focus` is only meaningful in split layout: it's `"list"` or `"detail"` when
+`layout` is `"split"`, and an empty string otherwise.
 
 ### Example
 

@@ -27,9 +27,10 @@ import (
 
 // listJobsResponse is the JSON shape returned by GET /api/jobs.
 type listJobsResponse struct {
-	Jobs    []storage.ReviewJob `json:"jobs"`
-	HasMore bool                `json:"has_more"`
-	Stats   storage.JobStats    `json:"stats"`
+	Jobs          []storage.ReviewJob `json:"jobs"`
+	HasMore       bool                `json:"has_more"`
+	Stats         storage.JobStats    `json:"stats"`
+	FilteredStats *storage.JobStats   `json:"filtered_stats"`
 }
 
 // fetchJobs calls GET /api/jobs via the mux, asserts HTTP 200,
@@ -160,8 +161,10 @@ func TestListJobsWithGitRefFilter(t *testing.T) {
 	}
 
 	t.Run("git_ref filter returns matching job", func(t *testing.T) {
-		resp := fetchJobs(t, server, "git_ref=abc123")
+		resp := fetchJobs(t, server, "git_ref=abc123&status=queued")
 		assert.Len(t, resp.Jobs, 1, "job count")
+		assert.Equal(t, 1, resp.Stats.Queued, "filtered queued count")
+		assert.Equal(t, 0, resp.Stats.Done, "filtered done count")
 		if len(resp.Jobs) > 0 {
 			assert.Equal(t, "abc123", resp.Jobs[0].GitRef, "GitRef")
 		}
@@ -170,6 +173,7 @@ func TestListJobsWithGitRefFilter(t *testing.T) {
 	t.Run("git_ref filter with no match returns empty", func(t *testing.T) {
 		resp := fetchJobs(t, server, "git_ref=nonexistent")
 		assert.Empty(t, resp.Jobs, "job count")
+		assert.Equal(t, 0, resp.Stats.Queued, "filtered queued count")
 	})
 
 	t.Run("git_ref filter with range ref", func(t *testing.T) {
@@ -198,11 +202,31 @@ func TestHandleListJobsClosedFilter(t *testing.T) {
 	t.Run("closed=false", func(t *testing.T) {
 		resp := fetchJobs(t, server, "closed=false")
 		assert.Len(t, resp.Jobs, 1, "expected 1 open job")
+		assert.Equal(t, 2, resp.Stats.Done, "aggregate done count")
+		assert.Equal(t, 1, resp.Stats.Open, "aggregate open count")
+		assert.Equal(t, 1, resp.Stats.Closed, "aggregate closed count")
+		require.NotNil(t, resp.FilteredStats)
+		assert.Equal(t, 1, resp.FilteredStats.Done, "filtered done count")
+		assert.Equal(t, 1, resp.FilteredStats.Open, "filtered open count")
+		assert.Equal(t, 0, resp.FilteredStats.Closed, "filtered closed count")
 	})
 
 	t.Run("branch filter", func(t *testing.T) {
 		resp := fetchJobs(t, server, "branch=main")
 		assert.Len(t, resp.Jobs, 2, "expected 2 jobs on main")
+	})
+
+	t.Run("empty branch filter", func(t *testing.T) {
+		commit3, err := db.GetOrCreateCommit(repo.ID, "ccc", "A", "S3", time.Now())
+		require.NoError(t, err)
+		_, err = db.EnqueueJob(storage.EnqueueOpts{RepoID: repo.ID, CommitID: commit3.ID, GitRef: "ccc", Agent: "codex"})
+		require.NoError(t, err)
+
+		resp := fetchJobs(t, server, "branch_empty=true")
+		require.Len(t, resp.Jobs, 1)
+		assert.Empty(t, resp.Jobs[0].Branch)
+		assert.Equal(t, 1, resp.Stats.Queued)
+		assert.Equal(t, 0, resp.Stats.Done)
 	})
 }
 

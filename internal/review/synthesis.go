@@ -96,12 +96,7 @@ func BuildSynthesisPrompt(
 			b.WriteString(
 				"(review skipped — provider unavailable)")
 		} else if r.Output != "" {
-			output := r.Output
-			if len(output) > maxPerReview {
-				output = output[:maxPerReview] +
-					"\n\n...(truncated)"
-			}
-			b.WriteString(output)
+			b.WriteString(TruncateOutput(r.Output, maxPerReview))
 		} else if r.Status == ResultFailed {
 			b.WriteString("(no output — review failed)")
 		}
@@ -181,13 +176,11 @@ func FormatRawBatchComment(
 				"**Error:** Review failed. " +
 					"Check CI logs for details.\n\n")
 		} else if r.Output != "" {
-			output := r.Output
+			// This body is posted as a real PR/MR comment, so the cut has to be
+			// UTF-8 safe: a raw slice can split a multi-byte rune and the API
+			// receives U+FFFD.
 			const maxLen = 15000
-			if len(output) > maxLen {
-				output = output[:maxLen] +
-					"\n\n...(truncated)"
-			}
-			b.WriteString(output)
+			b.WriteString(TruncateOutput(r.Output, maxLen))
 			b.WriteString("\n\n")
 		} else {
 			b.WriteString("(no output)\n\n")
@@ -210,18 +203,30 @@ func FormatAllFailedComment(
 	quotaSkips := CountQuotaFailures(reviews)
 	timeoutSkips := CountTimeoutCancellations(reviews)
 	transientSkips := CountTransientFailures(reviews)
+	emptyOutputSkips := 0
+	for _, r := range reviews {
+		if r.Status == ResultDone && !IsSubstantiveOutput(r) {
+			emptyOutputSkips++
+		}
+	}
 	allSkipped := len(reviews) > 0 &&
-		quotaSkips+timeoutSkips+transientSkips == len(reviews)
+		quotaSkips+timeoutSkips+transientSkips+emptyOutputSkips == len(reviews)
 
 	var b strings.Builder
 	if allSkipped {
 		fmt.Fprintf(&b,
 			"## roborev: Review Skipped (`%s`)\n\n",
 			gitrepo.ShortSHA(headSHA))
-		b.WriteString(
-			"All review agents were skipped " +
-				"due to quota exhaustion, timeout, or provider " +
-				"unavailability.\n\n")
+		if emptyOutputSkips == 0 {
+			b.WriteString(
+				"All review agents were skipped " +
+					"due to quota exhaustion, timeout, or provider " +
+					"unavailability.\n\n")
+		} else {
+			b.WriteString(
+				"No review output was produced; every review was skipped " +
+					"or completed without output.\n\n")
+		}
 	} else {
 		fmt.Fprintf(&b,
 			"## roborev: Review Failed (`%s`)\n\n",
@@ -243,6 +248,10 @@ func FormatAllFailedComment(
 			fmt.Fprintf(&b,
 				"- Review %d: skipped (provider unavailable)\n",
 				i+1)
+		} else if r.Status == ResultDone && !IsSubstantiveOutput(r) {
+			fmt.Fprintf(&b,
+				"- Review %d: skipped (no output)\n",
+				i+1)
 		} else {
 			fmt.Fprintf(&b,
 				"- Review %d: failed\n",
@@ -262,43 +271,25 @@ func FormatAllFailedComment(
 }
 
 // FormatTransientGiveUpComment is posted after the 3-day transient retry cap.
-// It explains that the AI provider was repeatedly unavailable and includes a
-// one-line excerpt of the last error encountered.
-func FormatTransientGiveUpComment(headSHA, lastErrExcerpt string) string {
+// It explains that the AI provider was repeatedly unavailable without exposing
+// the underlying agent error.
+func FormatTransientGiveUpComment(headSHA string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "## roborev: Review Unavailable (`%s`)\n\n", gitrepo.ShortSHA(headSHA))
 	b.WriteString("roborev tried to review this PR for 3 days but the AI provider " +
 		"was repeatedly unavailable, so no review was produced.\n\n")
-	if strings.TrimSpace(lastErrExcerpt) != "" {
-		fmt.Fprintf(&b, "Last error: `%s`\n", oneLineExcerpt(lastErrExcerpt))
-	}
 	return b.String()
 }
 
 // FormatGenuineSoftNoteComment is posted after bounded genuine failures. It
 // notes the agent repeatedly failed to run and that roborev will retry on the
-// next commit, with a one-line excerpt of the last error.
-func FormatGenuineSoftNoteComment(headSHA, lastErrExcerpt string) string {
+// next commit without exposing the underlying agent error.
+func FormatGenuineSoftNoteComment(headSHA string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "## roborev: Review Unavailable (`%s`)\n\n", gitrepo.ShortSHA(headSHA))
 	b.WriteString("The review agent repeatedly failed to run (likely an agent or " +
 		"configuration error). roborev will try again on the next commit.\n\n")
-	if strings.TrimSpace(lastErrExcerpt) != "" {
-		fmt.Fprintf(&b, "Last error: `%s`\n", oneLineExcerpt(lastErrExcerpt))
-	}
 	return b.String()
-}
-
-// oneLineExcerpt flattens a message to a single line (newlines to spaces,
-// carriage returns dropped) and truncates to 200 bytes for inline display.
-func oneLineExcerpt(s string) string {
-	s = strings.ReplaceAll(strings.ReplaceAll(s, "\n", " "), "\r", "")
-	s = strings.TrimSpace(s)
-	const max = 200
-	if len(s) > max {
-		s = strings.TrimRight(TrimPartialRune(s[:max]), " ") + "..."
-	}
-	return s
 }
 
 // IsQuotaFailure returns true if a review's error indicates a

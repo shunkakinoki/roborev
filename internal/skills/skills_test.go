@@ -14,6 +14,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/roborev/internal/autofix"
 )
 
 type agentCase struct {
@@ -220,6 +222,43 @@ func TestClaudeSkillBodiesAcceptEveryExplicitInvocationPath(t *testing.T) {
 		assert.Contains(t, section, "without one of these explicit mechanisms", "%s must distinguish ordinary prose", skill.DirName)
 		assert.Contains(t, section, "must use native behavior", "%s missing native fallback", skill.DirName)
 		assert.Contains(t, section, "must not run roborev", "%s missing no-roborev instruction", skill.DirName)
+	}
+}
+
+func TestAgentSkillsDocumentSandboxRecovery(t *testing.T) {
+	tests := []struct {
+		agent          Agent
+		parameter      string
+		otherParameter string
+	}{
+		{
+			agent:          AgentCodex,
+			parameter:      `sandbox_permissions: "require_escalated"`,
+			otherParameter: "dangerouslyDisableSandbox: true",
+		},
+		{
+			agent:          AgentClaude,
+			parameter:      "dangerouslyDisableSandbox: true",
+			otherParameter: `sandbox_permissions: "require_escalated"`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(string(tt.agent), func(t *testing.T) {
+			spec, ok := lookupAgent(tt.agent)
+			require.True(t, ok)
+			skills, err := embeddedSkillsForAgent(spec)
+			require.NoError(t, err)
+			require.Len(t, skills, 10)
+
+			for _, skill := range skills {
+				content := strings.Join(strings.Fields(string(skill.Content)), " ")
+				assert.Contains(t, content, "roborev uses a local daemon", skill.DirName)
+				assert.Contains(t, content, "Do not start or restart the daemon", skill.DirName)
+				assert.Contains(t, content, tt.parameter, skill.DirName)
+				assert.NotContains(t, content, tt.otherParameter, skill.DirName)
+			}
+		})
 	}
 }
 
@@ -992,6 +1031,23 @@ func TestDerivedExplicitInvocationWordingUsesTargetAgent(t *testing.T) {
 	}
 }
 
+func TestDerivedSandboxWordingUsesTargetAgent(t *testing.T) {
+	derived, err := renderDerivedSkills(os.DirFS("."))
+	require.NoError(t, err)
+
+	for relPath, content := range derived {
+		text := strings.Join(strings.Fields(string(content)), " ")
+		if strings.HasPrefix(relPath, "droid/") || strings.HasPrefix(relPath, "grok/") {
+			assert.Contains(t, text, "runtime's supported sandbox escalation mechanism", relPath)
+			assert.NotContains(t, text, `sandbox_permissions: "require_escalated"`, relPath)
+			assert.NotContains(t, text, "dangerouslyDisableSandbox: true", relPath)
+		} else {
+			assert.Contains(t, text, "dangerouslyDisableSandbox: true", relPath)
+			assert.NotContains(t, text, `sandbox_permissions: "require_escalated"`, relPath)
+		}
+	}
+}
+
 func TestFixSkillsUseHeredocForCommentText(t *testing.T) {
 	for _, agent := range []Agent{AgentClaude, AgentCodex, AgentDroid, AgentGrok} {
 		t.Run(string(agent), func(t *testing.T) {
@@ -1013,6 +1069,28 @@ func TestFixSkillsUseHeredocForCommentText(t *testing.T) {
 			assert.NotContains(t, content, "Escape quotes and special characters in the bash command")
 			assert.Equal(t, 0, strings.Count(content, `roborev comment --commenter roborev-fix --job 1019 "`))
 			assert.Equal(t, 0, strings.Count(content, `roborev comment --commenter roborev-fix --job 1021 "`))
+		})
+	}
+}
+
+// If the runtime policy heading and shipped skill drift apart, an Agent Hook
+// invocation can supply policy the selected skill does not recognize.
+func TestFixSkillsRecognizeRuntimeAutofixGuidelines(t *testing.T) {
+	for _, agent := range []Agent{AgentClaude, AgentCodex, AgentDroid, AgentGrok} {
+		t.Run(string(agent), func(t *testing.T) {
+			spec, ok := lookupAgent(agent)
+			require.True(t, ok)
+			skills, err := embeddedSkillsForAgent(spec)
+			require.NoError(t, err)
+
+			var content string
+			for _, skill := range skills {
+				if skill.DirName == "roborev-fix" {
+					content = string(skill.Content)
+				}
+			}
+			require.NotEmpty(t, content)
+			assert.Contains(t, content, autofix.GuidelinesHeading)
 		})
 	}
 }

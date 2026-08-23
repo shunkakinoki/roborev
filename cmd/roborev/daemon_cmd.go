@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -17,6 +18,12 @@ import (
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/telemetry"
 	"go.kenn.io/roborev/internal/version"
+)
+
+var (
+	daemonEnsure   = ensureDaemon
+	daemonStop     = stopDaemon
+	daemonDiscover = uiRuntimeInfo
 )
 
 func daemonCmd() *cobra.Command {
@@ -29,10 +36,10 @@ func daemonCmd() *cobra.Command {
 		Use:   "start",
 		Short: "Start the daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := ensureDaemon(); err != nil {
+			if err := daemonEnsure(); err != nil {
 				return err
 			}
-			fmt.Println("Daemon started")
+			writeDaemonLifecycleResult("Daemon started")
 			return nil
 		},
 	})
@@ -41,7 +48,7 @@ func daemonCmd() *cobra.Command {
 		Use:   "stop",
 		Short: "Stop the daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := stopDaemon(); errors.Is(err, ErrDaemonNotRunning) {
+			if err := daemonStop(); errors.Is(err, ErrDaemonNotRunning) {
 				fmt.Println("Daemon was not running")
 				return nil
 			} else if err != nil {
@@ -57,35 +64,77 @@ func daemonCmd() *cobra.Command {
 		Short: "Restart the daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			wasRunning := true
-			if err := stopDaemon(); errors.Is(err, ErrDaemonNotRunning) {
+			if err := daemonStop(); errors.Is(err, ErrDaemonNotRunning) {
 				wasRunning = false
 			} else if err != nil {
 				return err
 			}
-			if err := ensureDaemon(); err != nil {
+			if err := daemonEnsure(); err != nil {
 				return err
 			}
 			if wasRunning {
-				fmt.Println("Daemon restarted")
+				writeDaemonLifecycleResult("Daemon restarted")
 			} else {
-				fmt.Println("Daemon started (was not running)")
+				writeDaemonLifecycleResult("Daemon started (was not running)")
 			}
 			return nil
 		},
 	})
 
+	cmd.AddCommand(statusCmd())
 	cmd.AddCommand(daemonRunCmd())
 
 	return cmd
 }
 
+func writeDaemonLifecycleResult(message string) {
+	fmt.Println(message)
+	fmt.Printf("Web UI: %s\n", displayWebUI(discoverWebUI(daemonDiscover)))
+}
+
+// webUIStatus describes the daemon's browser UI: either a reachable URL, or
+// the daemon-published reason the listener is not running.
+type webUIStatus struct {
+	url            string
+	disabledReason string
+}
+
+func discoverWebUI(discover func() (*daemon.RuntimeInfo, error)) webUIStatus {
+	runtimeInfo, err := discover()
+	if err != nil || runtimeInfo == nil {
+		return webUIStatus{}
+	}
+	if runtimeInfo.WebOrigin == "" {
+		return webUIStatus{disabledReason: runtimeInfo.WebDisabledReason}
+	}
+	webURL, err := browserRootURL(runtimeInfo.WebOrigin, runtimeInfo.WebBasePath)
+	if err != nil {
+		return webUIStatus{}
+	}
+	return webUIStatus{url: webURL}
+}
+
+func displayWebUI(status webUIStatus) string {
+	if status.url != "" {
+		return status.url
+	}
+	switch status.disabledReason {
+	case daemon.WebDisabledReasonMissingAssets:
+		return "disabled (this build has no embedded web assets; reinstall from an official release)"
+	case daemon.WebDisabledReasonConfig:
+		return "disabled ([web] enabled = false)"
+	}
+	return "unavailable"
+}
+
 // daemonRunCmd runs the daemon in the foreground (used by "daemon start" internally)
 func daemonRunCmd() *cobra.Command {
 	var (
-		dbPath     string
-		configPath string
-		addr       string
-		workers    int
+		dbPath       string
+		configPath   string
+		addr         string
+		workers      int
+		webDevOrigin string
 	)
 
 	cmd := &cobra.Command{
@@ -194,7 +243,11 @@ func daemonRunCmd() *cobra.Command {
 			defer cancel()
 
 			// Create and start server
-			server := daemon.NewServer(db, cfg, configPath)
+			var serverOptions []daemon.ServerOption
+			if webDevOrigin != "" {
+				serverOptions = append(serverOptions, daemon.WithWebDevelopmentOrigin(webDevOrigin))
+			}
+			server := daemon.NewServer(db, cfg, configPath, serverOptions...)
 			server.SetTelemetry(telemetryReporter)
 			if syncWorker != nil {
 				server.SetSyncWorker(syncWorker)
@@ -231,25 +284,16 @@ func daemonRunCmd() *cobra.Command {
 				}
 
 				cancel() // Cancel context to stop config watcher
-				if ciPoller != nil {
-					ciPoller.Stop()
-				}
-				if syncWorker != nil {
-					// Final push before shutdown to ensure local changes are synced
-					if err := syncWorker.FinalPush(); err != nil {
-						log.Printf("Final sync push error: %v", err)
-					}
-					syncWorker.Stop()
-				}
-				if err := server.Stop(); err != nil {
-					log.Printf("Shutdown error: %v", err)
-				}
+				stopDaemonWithRetry(server.Stop, time.Second)
 				// Note: Don't call os.Exit here - let server.Start() return naturally
 				// after Stop() is called. This allows proper cleanup and testability.
 			}()
 
-			// Start server (blocks until shutdown)
-			return server.Start(ctx)
+			// Start blocks until HTTP serving stops. Join Stop before returning so
+			// the process cannot exit while workers are still finalizing.
+			startErr := server.Start(ctx)
+			stopErr := server.Stop()
+			return errors.Join(startErr, stopErr)
 		},
 	}
 
@@ -257,6 +301,21 @@ func daemonRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&configPath, "config", config.GlobalConfigPath(), "path to config file")
 	cmd.Flags().StringVar(&addr, "addr", "", "server address (overrides config)")
 	cmd.Flags().IntVar(&workers, "workers", 0, "number of workers (overrides config)")
+	cmd.Flags().StringVar(&webDevOrigin, "web-dev-origin", "", "exact loopback origin for web development")
+	if err := cmd.Flags().MarkHidden("web-dev-origin"); err != nil {
+		panic(err)
+	}
 
 	return cmd
+}
+
+func stopDaemonWithRetry(stop func() error, retryDelay time.Duration) {
+	for {
+		if err := stop(); err != nil {
+			log.Printf("Prepare daemon shutdown failed; retrying: %v", err)
+			time.Sleep(retryDelay)
+			continue
+		}
+		return
+	}
 }

@@ -20,7 +20,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	googlegithub "github.com/google/go-github/v88/github"
+	googlegithub "github.com/google/go-github/v90/github"
 
 	"go.kenn.io/roborev/internal/agent"
 	"go.kenn.io/roborev/internal/config"
@@ -113,12 +113,16 @@ type CIPoller struct {
 	// owned by the single poll goroutine.
 	quietHours *config.QuietHoursWindow
 
-	subID      int // broadcaster subscription ID for event listening
-	stopCh     chan struct{}
-	doneCh     chan struct{}
-	cancelFunc context.CancelFunc // cancels the context for external commands
-	mu         sync.Mutex
-	running    bool
+	subID          int // broadcaster subscription ID for event listening
+	stopCh         chan struct{}
+	doneCh         chan struct{}
+	eventDoneCh    chan struct{}
+	cancelFunc     context.CancelFunc // cancels the context for external commands
+	mu             sync.Mutex
+	running        bool
+	stopping       bool
+	pollStopping   bool
+	eventsStopping bool
 }
 
 // NewCIPoller creates a new CI poller.
@@ -192,8 +196,8 @@ func (p *CIPoller) Start() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.running {
-		return fmt.Errorf("CI poller already running")
+	if p.running || p.stopping {
+		return fmt.Errorf("CI poller already running or stopping")
 	}
 
 	cfg := p.cfgGetter.Config()
@@ -210,8 +214,12 @@ func (p *CIPoller) Start() error {
 
 	p.stopCh = make(chan struct{})
 	p.doneCh = make(chan struct{})
+	p.eventDoneCh = make(chan struct{})
 	p.cancelFunc = cancel
 	p.running = true
+	p.stopping = false
+	p.pollStopping = false
+	p.eventsStopping = false
 
 	stopCh := p.stopCh
 	doneCh := p.doneCh
@@ -226,7 +234,9 @@ func (p *CIPoller) Start() error {
 	if p.broadcaster != nil {
 		subID, eventCh := p.broadcaster.Subscribe("")
 		p.subID = subID
-		go p.listenForEvents(stopCh, eventCh)
+		go p.listenForEvents(eventCh, p.eventDoneCh)
+	} else {
+		close(p.eventDoneCh)
 	}
 
 	go p.run(ctx, stopCh, doneCh, interval)
@@ -234,26 +244,60 @@ func (p *CIPoller) Start() error {
 	return nil
 }
 
-// Stop gracefully shuts down the CI poller
-func (p *CIPoller) Stop() {
+// BeginStop makes the polling loop inert and waits for its current poll to
+// return. The event listener remains subscribed so active workers can still
+// deliver completion events during the daemon drain.
+func (p *CIPoller) BeginStop() {
 	p.mu.Lock()
-	if !p.running {
+	if !p.running && !p.stopping {
 		p.mu.Unlock()
 		return
 	}
 	stopCh := p.stopCh
 	doneCh := p.doneCh
 	cancel := p.cancelFunc
-	p.running = false
+	startStop := !p.pollStopping
+	if startStop {
+		p.running = false
+		p.stopping = true
+		p.pollStopping = true
+	}
 	p.mu.Unlock()
 
-	cancel() // Cancel context for external commands
-	close(stopCh)
-	<-doneCh
-
-	if p.broadcaster != nil && p.subID != 0 {
-		p.broadcaster.Unsubscribe(p.subID)
+	if startStop {
+		cancel() // Cancel polling and its external commands.
+		close(stopCh)
 	}
+	<-doneCh
+}
+
+// Stop sends the event-listener poison pill after polling has stopped. Closing
+// the FIFO event channel leaves buffered completion events ahead of the close,
+// and eventDoneCh joins queued or active handlers before returning.
+func (p *CIPoller) Stop() {
+	p.BeginStop()
+
+	p.mu.Lock()
+	if !p.stopping {
+		p.mu.Unlock()
+		return
+	}
+	eventDoneCh := p.eventDoneCh
+	subID := p.subID
+	startStop := !p.eventsStopping
+	if startStop {
+		p.eventsStopping = true
+	}
+	p.mu.Unlock()
+
+	if startStop && p.broadcaster != nil && subID != 0 {
+		p.broadcaster.Unsubscribe(subID)
+	}
+	<-eventDoneCh
+
+	p.mu.Lock()
+	p.stopping = false
+	p.mu.Unlock()
 }
 
 // HealthCheck returns whether the CI poller is healthy
@@ -489,7 +533,7 @@ func (p *CIPoller) enqueuePanelRun(ctx context.Context, ghRepo string, pr ghPR, 
 		return err
 	}
 
-	created, _, _, err := p.db.CreateCIPanelRun(ghRepo, pr.Number, pr.HeadRefOid, memberOpts, synthOpts)
+	created, _, synthJob, err := p.db.CreateCIPanelRun(ghRepo, pr.Number, pr.HeadRefOid, memberOpts, synthOpts)
 	if err != nil {
 		return fmt.Errorf("create CI panel run: %w", err)
 	}
@@ -497,6 +541,7 @@ func (p *CIPoller) enqueuePanelRun(ctx context.Context, ghRepo string, pr ghPR, 
 		// Another poller owns this PR+HEAD; it set (or will set) the status.
 		return nil
 	}
+	p.broadcastJobEvent("job.enqueued", synthJob)
 
 	headShort := gitpkg.ShortSHA(pr.HeadRefOid)
 	log.Printf("CI poller: created panel run for %s#%d (HEAD=%s, %d members, range=%s)",
@@ -1412,8 +1457,7 @@ func cloneRemoteMatches(path, ghRepo, rawBaseURL string) (bool, error) {
 	cfgCmd.Env = append(os.Environ(), "LC_ALL=C")
 	cfgOut, err := cfgCmd.CombinedOutput()
 	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
+		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
 			code := exitErr.ExitCode()
 			// Exit 1 = key not found in config.
 			if code == 1 {
@@ -1787,23 +1831,16 @@ func gitFetchPRHead(ctx context.Context, repoPath string, prNumber int, env []st
 
 // listenForEvents subscribes to broadcaster events and posts PR comments
 // when CI-triggered reviews complete or fail.
-func (p *CIPoller) listenForEvents(stopCh chan struct{}, eventCh <-chan Event) {
-	for {
-		select {
-		case <-stopCh:
-			return
-		case event, ok := <-eventCh:
-			if !ok {
-				return
-			}
-			switch event.Type {
-			case "review.completed":
-				p.handleReviewCompleted(event)
-			case "review.failed":
-				p.handleReviewFailed(event)
-			case "review.canceled":
-				p.handleReviewCanceled(event)
-			}
+func (p *CIPoller) listenForEvents(eventCh <-chan Event, doneCh chan<- struct{}) {
+	defer close(doneCh)
+	for event := range eventCh {
+		switch event.Type {
+		case "review.completed":
+			p.handleReviewCompleted(event)
+		case "review.failed":
+			p.handleReviewFailed(event)
+		case "review.canceled":
+			p.handleReviewCanceled(event)
 		}
 	}
 }
@@ -2056,7 +2093,7 @@ func (p *CIPoller) finalizePanelRun(row *storage.CIPanel, members []storage.Batc
 		p.postPanelComment(row, members, storage.PanelOutcomeNoReviewPosted)
 	case OutcomeGenuineGiveUp:
 		p.postPanelGiveUp(row,
-			reviewpkg.FormatGenuineSoftNoteComment(row.HeadSHA, out.LastErrorExcerpt),
+			reviewpkg.FormatGenuineSoftNoteComment(row.HeadSHA),
 			"error", "All reviews failed")
 	case OutcomeDeferTransient:
 		p.deferTransientPanel(row, attempt, out.LastErrorExcerpt)
@@ -2169,7 +2206,7 @@ func (p *CIPoller) postPanelGiveUp(row *storage.CIPanel, body, statusState, stat
 func (p *CIPoller) deferTransientPanel(row *storage.CIPanel, attempt *storage.ReviewAttempt, excerpt string) {
 	now := time.Now()
 	if reviewpkg.DefaultRetrySchedule.TransientExhausted(now.Sub(attempt.FirstAttemptAt)) {
-		p.postPanelGiveUp(row, reviewpkg.FormatTransientGiveUpComment(row.HeadSHA, excerpt),
+		p.postPanelGiveUp(row, reviewpkg.FormatTransientGiveUpComment(row.HeadSHA),
 			"success", "Review unavailable")
 		return
 	}
@@ -2219,8 +2256,12 @@ func (p *CIPoller) recordDeferral(
 // fallback, which already carries the header and renders row.HeadSHA. SHAs
 // always come from row.HeadSHA.
 func (p *CIPoller) panelCommentBody(row *storage.CIPanel, members []storage.BatchReviewResult) string {
+	results := toReviewResults(members)
+	if !reviewpkg.HasSubstantiveOutput(results) {
+		return reviewpkg.FormatAllFailedComment(results, row.HeadSHA)
+	}
 	raw := func() string {
-		return reviewpkg.FormatRawBatchComment(toReviewResults(members), row.HeadSHA)
+		return reviewpkg.FormatRawBatchComment(results, row.HeadSHA)
 	}
 	synth, err := p.db.GetSynthesisJob(row.PanelRunUUID)
 	if err != nil || synth == nil || synth.Status != storage.JobStatusDone {
@@ -2367,7 +2408,7 @@ func (p *CIPoller) supersedePriorPanels(ghRepo string, prNumber int, newHeadSHA 
 			log.Printf("CI poller: supersede: delete review attempt for %s#%d@%s: %v",
 				ghRepo, prNumber, gitpkg.ShortSHA(row.HeadSHA), err)
 		}
-		cancelPanelRunParentFirst(p.db, p.jobCancelFn, synth)
+		p.broadcastCanceledJobs(cancelPanelRunParentFirst(p.db, p.jobCancelFn, synth))
 		superseded++
 	}
 	if superseded > 0 {
@@ -2734,8 +2775,26 @@ func (p *CIPoller) cancelClosedPRPanelRuns(ghRepo string, prNumber int) {
 			log.Printf("CI poller: closed-PR: delete mapping %s: %v", row.PanelRunUUID, err)
 			continue
 		}
-		cancelPanelRunParentFirst(p.db, p.jobCancelFn, synth)
+		p.broadcastCanceledJobs(cancelPanelRunParentFirst(p.db, p.jobCancelFn, synth))
 		log.Printf("CI poller: canceled panel run for closed PR %s#%d", ghRepo, prNumber)
+	}
+}
+
+// broadcastJobEvent announces a CI-poller mutation to live clients. CI poller
+// maintenance did not historically run user hooks, so preserve that boundary
+// while still using the shared event stream for browser reconciliation.
+func (p *CIPoller) broadcastJobEvent(eventType string, job *storage.ReviewJob) {
+	if p.broadcaster == nil || job == nil {
+		return
+	}
+	event := eventForJob(eventType, job, job.ID)
+	event.SuppressHooks = true
+	p.broadcaster.Broadcast(event)
+}
+
+func (p *CIPoller) broadcastCanceledJobs(jobs []storage.ReviewJob) {
+	for i := range jobs {
+		p.broadcastJobEvent("review.canceled", &jobs[i])
 	}
 }
 

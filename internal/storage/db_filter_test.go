@@ -363,12 +363,12 @@ func TestListJobsWithRepoPaths(t *testing.T) {
 	require.Equal(t, "repo1", claimed.RepoName)
 	require.NoError(t, db.CompleteJob(claimed.ID, "codex", "prompt", "output"))
 
-	inScope, err := db.CountJobStats("",
+	inScope, err := db.CountJobStats("", "",
 		WithRepoPaths([]string{repo1.RootPath, repo2.RootPath}))
 	require.NoError(t, err)
 	assert.Equal(1, inScope.Done, "repo1's done job counted when repo1 is in scope")
 
-	outOfScope, err := db.CountJobStats("", WithRepoPaths([]string{repo3.RootPath}))
+	outOfScope, err := db.CountJobStats("", "", WithRepoPaths([]string{repo3.RootPath}))
 	require.NoError(t, err)
 	assert.Equal(0, outOfScope.Done, "repo1's done job excluded when only repo3 is in scope")
 }
@@ -507,6 +507,13 @@ func TestWithBranchOrEmpty(t *testing.T) {
 		require.NoError(t, err, "ListJobs failed: %v")
 
 		assert.Len(t, jobs, 2)
+	})
+
+	t.Run("WithEmptyBranch returns only branchless jobs", func(t *testing.T) {
+		jobs, err := db.ListJobs("", "", 50, 0, WithEmptyBranch())
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+		assert.Empty(t, jobs[0].Branch)
 	})
 }
 
@@ -985,12 +992,16 @@ func TestPrefixFilterWithSpecialChars(t *testing.T) {
 
 	t.Run("CountJobStats with special-char prefix", func(t *testing.T) {
 		stats, err := db.CountJobStats(
-			"", WithRepoPrefix(wsPrefix),
+			"", "", WithRepoPrefix(wsPrefix),
 		)
 		require.NoError(t, err, "CountJobStats failed: %v")
 
 		assert.Equal(t, 2, stats.Done)
 		assert.Equal(t, 2, stats.Open)
+		assert.Equal(t, 0, stats.Queued)
+		assert.Equal(t, 0, stats.Running)
+		assert.Equal(t, 0, stats.Failed)
+		assert.Equal(t, 0, stats.Canceled)
 	})
 
 	t.Run("ListReposWithReviewCounts with special-char prefix", func(t *testing.T) {
@@ -1018,7 +1029,7 @@ func TestPrefixFilterWithSpecialChars(t *testing.T) {
 		assert.Len(t, jobs, 1)
 
 		stats, err := db.CountJobStats(
-			"", WithRepoPrefix(`C:\Users\dev\workspace`),
+			"", "", WithRepoPrefix(`C:\Users\dev\workspace`),
 		)
 		require.NoError(t, err, "CountJobStats with backslash prefix should not error: %v")
 		assert.Equal(t, 1, stats.Open)
@@ -1200,6 +1211,33 @@ func TestListJobsWithBeforeCursor(t *testing.T) {
 		// jobs[0], jobs[1], jobs[3] have branch=main and ID < jobs[4].ID
 		assert.Len(t, result, 3)
 	})
+}
+
+func TestListJobsPaginatesRerunsByEnqueueTime(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+	_, jobs := seedJobs(t, db, "/tmp/rerun-cursor-repo", 3)
+	base := time.Now().Add(-3 * time.Hour).UTC().Truncate(time.Second)
+
+	for index, job := range jobs {
+		_, err := db.Exec(
+			`UPDATE review_jobs SET status = 'done', enqueued_at = ? WHERE id = ?`,
+			base.Add(time.Duration(index)*time.Hour).Format(time.RFC3339), job.ID,
+		)
+		require.NoError(t, err)
+	}
+	require.NoError(t, db.ReenqueueJob(jobs[0].ID, ReenqueueOpts{}))
+
+	first, err := db.ListJobs("", "", 2, 0)
+	require.NoError(t, err)
+	require.Len(t, first, 2)
+	assert.Equal(t, jobs[0].ID, first[0].ID)
+	assert.Equal(t, jobs[2].ID, first[1].ID)
+
+	second, err := db.ListJobs("", "", 2, 0, WithBeforeCursor(first[1].ID))
+	require.NoError(t, err)
+	require.Len(t, second, 1)
+	assert.Equal(t, jobs[1].ID, second[0].ID)
 }
 
 func TestListJobsWithoutPrompt(t *testing.T) {

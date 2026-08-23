@@ -245,6 +245,18 @@ func TestCodexReviewUnsafeMissingFlagErrors(t *testing.T) {
 	assert.Contains(t, err.Error(), "does not support")
 }
 
+func TestCodexReviewMarksPropagatedCapabilityProbeErrorUnavailable(t *testing.T) {
+	a, _ := setupMockCodex(t, false, MockCLIOpts{
+		ExitCode:    1,
+		StderrLines: []string{"native package missing"},
+	})
+
+	_, err := a.Review(context.Background(), t.TempDir(), "deadbeef", "prompt", nil)
+	require.Error(t, err)
+	assert.True(t, IsUnavailable(err))
+	assert.Contains(t, err.Error(), "native package missing")
+}
+
 func TestCodexReviewIncludesIgnoreUserConfigWhenSupported(t *testing.T) {
 	a, mock := setupMockCodex(t, false, MockCLIOpts{
 		HelpOutput:  "usage --sandbox " + codexIgnoreUserConfigFlag,
@@ -345,16 +357,11 @@ func TestCodexReviewWithSessionResumePassesResumeArgs(t *testing.T) {
 func TestCodexReviewTimeoutClosesStdoutPipe(t *testing.T) {
 	skipIfWindows(t)
 
-	prevWaitDelay := subprocessWaitDelay
-	subprocessWaitDelay = 20 * time.Millisecond
-	t.Cleanup(func() {
-		subprocessWaitDelay = prevWaitDelay
-	})
-
 	cmdPath := writeTempCommand(t, `#!/bin/sh
 case "$*" in *--help*) echo "usage --sandbox"; exit 0;; esac
 (sleep 0.2) &
 printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"partial"}}'
+sleep 0.2
 exit 0
 `)
 
@@ -534,5 +541,152 @@ func TestCodexReviewNoValidJSONReturnsError(t *testing.T) {
 	_, err := a.Review(context.Background(), t.TempDir(), "deadbeef", "prompt", nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "did not emit valid --json events")
-	assert.ErrorIs(t, err, errNoCodexJSON)
+	require.ErrorIs(t, err, errNoCodexJSON)
+	assert.True(t, IsUnavailable(err))
+}
+
+func TestCodexReviewMarksNonzeroNoJSONUnavailable(t *testing.T) {
+	a, _ := setupMockCodex(t, false, MockCLIOpts{
+		HelpOutput:  "usage --sandbox",
+		ExitCode:    1,
+		StderrLines: []string{"503 Service Unavailable"},
+	})
+
+	_, err := a.Review(context.Background(), t.TempDir(), "deadbeef", "prompt", nil)
+	require.Error(t, err)
+	assert.True(t, IsUnavailable(err))
+	require.ErrorIs(t, err, errNoCodexJSON)
+	assert.Contains(t, err.Error(), "503 Service Unavailable")
+}
+
+func TestCodexReviewNoJSONPreservesStdoutClassificationSignals(t *testing.T) {
+	tests := []struct {
+		name     string
+		stdout   string
+		wantKind LimitKind
+	}{
+		{
+			name:     "transient",
+			stdout:   "503 Service Unavailable",
+			wantKind: LimitKindTransient,
+		},
+		{
+			name:     "quota",
+			stdout:   "You've hit your usage limit",
+			wantKind: LimitKindQuota,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a, _ := setupMockCodex(t, false, MockCLIOpts{
+				HelpOutput:  "usage --sandbox",
+				ExitCode:    1,
+				StdoutLines: []string{tt.stdout},
+			})
+
+			_, err := a.Review(context.Background(), t.TempDir(), "deadbeef", "prompt", nil)
+			require.Error(t, err)
+			assert.True(t, IsUnavailable(err))
+			assert.Contains(t, err.Error(), tt.stdout)
+			assert.Equal(t, tt.wantKind, ClassifyLimit("codex", err.Error()).Kind)
+		})
+	}
+}
+
+func TestCodexReviewBoundsNoJSONStdoutDiagnostic(t *testing.T) {
+	const omittedTail = "TAIL-MUST-NOT-BE-RENDERED"
+	stdout := "503 Service Unavailable " + strings.Repeat("x", 600) + omittedTail
+	a, _ := setupMockCodex(t, false, MockCLIOpts{
+		HelpOutput:  "usage --sandbox",
+		ExitCode:    1,
+		StdoutLines: []string{stdout},
+	})
+
+	_, err := a.Review(context.Background(), t.TempDir(), "deadbeef", "prompt", nil)
+	require.Error(t, err)
+	assert.Equal(t, LimitKindTransient, ClassifyLimit("codex", err.Error()).Kind)
+	assert.NotContains(t, err.Error(), omittedTail)
+}
+
+func TestCodexReviewClassifiesNoJSONSignalsBeyondRenderedDiagnostics(t *testing.T) {
+	tests := []struct {
+		name     string
+		opts     MockCLIOpts
+		wantKind LimitKind
+	}{
+		{
+			name: "stdout",
+			opts: MockCLIOpts{
+				HelpOutput:  "usage --sandbox",
+				ExitCode:    1,
+				StdoutLines: []string{strings.Repeat("launcher warning ", 80) + "503 Service Unavailable"},
+			},
+			wantKind: LimitKindTransient,
+		},
+		{
+			name: "stderr",
+			opts: MockCLIOpts{
+				HelpOutput:  "usage --sandbox",
+				ExitCode:    1,
+				StderrLines: []string{strings.Repeat("launcher warning ", 80) + "You've hit your usage limit"},
+			},
+			wantKind: LimitKindQuota,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a, _ := setupMockCodex(t, false, tt.opts)
+
+			_, err := a.Review(context.Background(), t.TempDir(), "deadbeef", "prompt", nil)
+			require.Error(t, err)
+			classification, ok := LimitClassificationFromError(err)
+			require.True(t, ok)
+			assert.Equal(t, tt.wantKind, classification.Kind)
+			assert.Equal(t, LimitKindNone, ClassifyLimit("codex", err.Error()).Kind)
+		})
+	}
+}
+
+func TestCodexDiagnosticCaptureIsBoundedAndClassifiesTail(t *testing.T) {
+	capture := newCodexDiagnosticCapture()
+
+	for range 100 {
+		_, err := capture.Write([]byte(strings.Repeat("x", 100)))
+		require.NoError(t, err)
+	}
+	_, err := capture.Write([]byte("503 Service Unavailable"))
+	require.NoError(t, err)
+
+	assert.LessOrEqual(t, len(capture.String()), cliWaitErrorOutputLimit+3)
+	assert.Equal(t, LimitKindTransient, capture.Classification().Kind)
+}
+
+func TestCodexReviewNonzeroAfterValidJSONIsNotUnavailable(t *testing.T) {
+	a, _ := setupMockCodex(t, false, MockCLIOpts{
+		HelpOutput: "usage --sandbox",
+		ExitCode:   1,
+		StdoutLines: []string{
+			`{"type":"item.completed","item":{"type":"agent_message","text":"partial"}}`,
+		},
+	})
+
+	_, err := a.Review(context.Background(), t.TempDir(), "deadbeef", "prompt", nil)
+	require.Error(t, err)
+	assert.False(t, IsUnavailable(err))
+}
+
+func TestCodexReviewMarksCommandStartupErrorUnavailable(t *testing.T) {
+	cmdPath := writeTempCommand(t, `#!/bin/sh
+case "$*" in
+  *--help*) mv "$0" "$0.gone"; echo "usage --sandbox"; exit 0;;
+esac
+exit 0
+`)
+	a := NewCodexAgent(cmdPath)
+
+	_, err := a.Review(context.Background(), t.TempDir(), "deadbeef", "prompt", nil)
+	require.Error(t, err)
+	assert.True(t, IsUnavailable(err))
 }

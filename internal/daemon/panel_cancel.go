@@ -11,8 +11,12 @@ import (
 // cascadeCancelPanelMembers cancels every member of a synthesis parent's run.
 // It delegates to the shared cascadePanelMembers helper so the member-cancel
 // loop is single-sourced between the HTTP cancel path and the CI poller.
-func (s *Server) cascadeCancelPanelMembers(job *storage.ReviewJob) {
-	cascadePanelMembers(s.db, func(id int64) { s.workerPool.CancelJob(id) }, job)
+func (s *Server) cascadeCancelPanelMembers(
+	job *storage.ReviewJob, callerBroadcastsEvent bool,
+) []storage.ReviewJob {
+	return cascadePanelMembers(s.db, func(id int64) {
+		s.workerPool.cancelJob(id, callerBroadcastsEvent)
+	}, job)
 }
 
 // retireCIPanelForCanceledSynthesis makes a directly canceled CI synthesis
@@ -48,15 +52,18 @@ func (s *Server) retireCIPanelForCanceledSynthesis(job *storage.ReviewJob) {
 // otherwise have no path to a terminal state. killWorker kills the running
 // worker process for a member (may be nil — e.g. the CI poller in tests, where
 // it is nil-guarded by the caller).
-func cascadePanelMembers(db *storage.DB, killWorker func(int64), job *storage.ReviewJob) {
+func cascadePanelMembers(
+	db *storage.DB, killWorker func(int64), job *storage.ReviewJob,
+) []storage.ReviewJob {
 	if job == nil || job.PanelRole != storage.PanelRoleSynthesis || job.PanelRunUUID == "" {
-		return
+		return nil
 	}
 	members, err := db.GetPanelMembers(job.PanelRunUUID)
 	if err != nil {
 		log.Printf("cancel cascade: list members for %s: %v", job.PanelRunUUID, err)
-		return
+		return nil
 	}
+	canceled := make([]storage.ReviewJob, 0, len(members))
 	for i := range members {
 		m := &members[i]
 		if err := db.CancelJob(m.ID); err != nil {
@@ -68,7 +75,9 @@ func cascadePanelMembers(db *storage.DB, killWorker func(int64), job *storage.Re
 		if killWorker != nil {
 			killWorker(m.ID)
 		}
+		canceled = append(canceled, *m)
 	}
+	return canceled
 }
 
 // cancelPanelRunParentFirst tears down a whole panel run by canceling the
@@ -83,19 +92,26 @@ func cascadePanelMembers(db *storage.DB, killWorker func(int64), job *storage.Re
 // killWorker kills the running worker process and may be nil (nil-guarded).
 // Best-effort: an already-terminal synthesis (sql.ErrNoRows) is skipped, and the
 // member cascade still runs so partially-canceled runs converge to fully
-// terminal.
-func cancelPanelRunParentFirst(db *storage.DB, killWorker func(int64), synth *storage.ReviewJob) {
+// terminal. The returned jobs are exactly the rows this call transitioned, in
+// parent-first order, so callers can announce those state changes.
+func cancelPanelRunParentFirst(
+	db *storage.DB, killWorker func(int64), synth *storage.ReviewJob,
+) []storage.ReviewJob {
 	if synth == nil {
-		return
+		return nil
 	}
+	canceled := make([]storage.ReviewJob, 0, 1)
 	if err := db.CancelJob(synth.ID); err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			log.Printf("cancel cascade: cancel synthesis %d: %v", synth.ID, err)
 		}
-	} else if killWorker != nil {
-		killWorker(synth.ID)
+	} else {
+		canceled = append(canceled, *synth)
+		if killWorker != nil {
+			killWorker(synth.ID)
+		}
 	}
-	cascadePanelMembers(db, killWorker, synth)
+	return append(canceled, cascadePanelMembers(db, killWorker, synth)...)
 }
 
 // releaseSynthesisIfCanceledMember releases the run's synthesis when a member

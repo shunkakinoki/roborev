@@ -26,13 +26,13 @@ jobs:
     outputs:
       changed: ${{ steps.filter.outputs.go }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Detect Go changes
         id: filter
-        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d  # v4.0.1
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
         with:
           base: ${{ github.ref }}
           filters: |
@@ -50,11 +50,11 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
-          go-version: '1.26.4'
+          go-version: '1.27.0'
           cache: 'true'
 
       - name: Download v0.56 Windows release binary
@@ -70,8 +70,8 @@ jobs:
           tar -xzf $archive -C $extractDir
           "old_binary=$extractDir\roborev.exe" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-      - name: Run v0.56 daemon migration repro
+      - name: Verify v0.56 replacement safety
         shell: pwsh
         env:
           ROBOREV_MIGRATION_OLD_BINARY: ${{ steps.old.outputs.old_binary }}
-        run: go test -timeout 10m -tags "integration migration" ./cmd/roborev -run TestWindowsV056DaemonMigrationStart -count=1 -v
+        run: go test -timeout 10m -tags "integration migration" ./cmd/roborev -run TestWindowsV056DaemonMigrationRefusesUnsafeReplacement -count=1 -v

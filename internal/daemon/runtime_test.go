@@ -1,7 +1,9 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -11,14 +13,31 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	kitdaemon "go.kenn.io/kit/daemon"
 
 	"go.kenn.io/roborev/internal/testenv"
 )
+
+func TestWaitForGracefulDaemonExitHasNoTimeout(t *testing.T) {
+	var dead atomic.Bool
+	var returned atomic.Bool
+	go func() {
+		waitForGracefulDaemonExit(time.Millisecond, dead.Load)
+		returned.Store(true)
+	}()
+
+	assert.Never(t, returned.Load, 20*time.Millisecond, time.Millisecond)
+
+	dead.Store(true)
+	assert.Eventually(t, returned.Load, time.Second, time.Millisecond)
+}
 
 const (
 	defaultTestPort = 7373
@@ -161,7 +180,13 @@ func TestRuntimeInfoReadWrite(t *testing.T) {
 
 	t.Run("WriteAndRead", func(t *testing.T) {
 		// Write runtime info
-		err := WriteRuntime(DaemonEndpoint{Network: "tcp", Address: defaultTestAddr}, "test-version")
+		alternate := DaemonEndpoint{Network: "tcp", Address: "127.0.0.1:7374"}
+		err := WriteRuntime(
+			DaemonEndpoint{Network: "tcp", Address: defaultTestAddr},
+			&alternate,
+			"test-version",
+			nil,
+		)
 		if err != nil {
 			require.Condition(t, func() bool {
 				return false
@@ -191,6 +216,8 @@ func TestRuntimeInfoReadWrite(t *testing.T) {
 				return false
 			}, "Expected version 'test-version', got '%s'", info.Version)
 		}
+		assert.Equal(t, "tcp", info.AlternateNetwork)
+		assert.Equal(t, alternate.Address, info.AlternateAddress)
 	})
 
 	t.Run("Remove", func(t *testing.T) {
@@ -207,7 +234,100 @@ func TestRuntimeInfoReadWrite(t *testing.T) {
 	})
 }
 
-func TestKillDaemonSkipsHTTPForNonLoopback(t *testing.T) {
+func TestRuntimeInfoRoundTripsBrowserMetadata(t *testing.T) {
+	testenv.SetDataDir(t)
+	browser := &BrowserRuntimeInfo{
+		Address:      "127.0.0.1:7400",
+		Origin:       "https://reviews.example.com",
+		WebBasePath:  "/roborev-ci",
+		Capabilities: []string{"web-ui-v1", "web-session-v1"},
+	}
+	require.NoError(t, WriteRuntime(
+		DaemonEndpoint{Network: "tcp", Address: defaultTestAddr}, nil, "test-version", browser,
+	))
+	info, err := ReadRuntime()
+	require.NoError(t, err)
+	assert.Equal(t, browser.Address, info.WebAddress)
+	assert.Equal(t, browser.Origin, info.WebOrigin)
+	assert.Equal(t, browser.WebBasePath, info.WebBasePath)
+	assert.Equal(t, browser.Capabilities, info.WebCapabilities)
+
+	raw, err := os.ReadFile(RuntimePath())
+	require.NoError(t, err)
+	for _, secret := range []string{"auth_token", "cookie", "csrf", "tab_token", "instance_id"} {
+		assert.NotContains(t, strings.ToLower(string(raw)), secret)
+	}
+}
+
+func TestWriteRuntimeRejectsInvalidBrowserBasePath(t *testing.T) {
+	testenv.SetDataDir(t)
+	err := WriteRuntime(
+		DaemonEndpoint{Network: "tcp", Address: defaultTestAddr}, nil, "test-version",
+		&BrowserRuntimeInfo{
+			Address:     "127.0.0.1:7400",
+			Origin:      "https://reviews.example.com",
+			WebBasePath: "/roborev-ci/",
+		},
+	)
+	require.ErrorContains(t, err, "trailing slash")
+}
+
+func TestWriteRuntimeRejectsInvalidBrowserCapabilities(t *testing.T) {
+	testenv.SetDataDir(t)
+	for _, capabilities := range [][]string{{""}, {" web-ui-v1"}, {"web-ui-v1", "web-ui-v1"}} {
+		err := WriteRuntime(
+			DaemonEndpoint{Network: "tcp", Address: defaultTestAddr}, nil, "test-version",
+			&BrowserRuntimeInfo{Address: "127.0.0.1:7400", Origin: "http://127.0.0.1:7400", Capabilities: capabilities},
+		)
+		require.Error(t, err)
+	}
+}
+
+func TestRuntimeInfoRoundTripsWebDisabledReason(t *testing.T) {
+	testenv.SetDataDir(t)
+	for _, reason := range []string{WebDisabledReasonConfig, WebDisabledReasonMissingAssets} {
+		require.NoError(t, WriteRuntime(
+			DaemonEndpoint{Network: "tcp", Address: defaultTestAddr}, nil, "test-version",
+			&BrowserRuntimeInfo{DisabledReason: reason},
+		))
+		info, err := ReadRuntime()
+		require.NoError(t, err)
+		assert.Empty(t, info.WebOrigin)
+		assert.Equal(t, reason, info.WebDisabledReason)
+	}
+}
+
+func TestWriteRuntimeRejectsDisabledReasonWithListenerFields(t *testing.T) {
+	testenv.SetDataDir(t)
+	for _, browser := range []*BrowserRuntimeInfo{
+		{Origin: "http://127.0.0.1:7400", DisabledReason: WebDisabledReasonMissingAssets},
+		{Address: "127.0.0.1:7400", DisabledReason: WebDisabledReasonMissingAssets},
+		{WebBasePath: "/roborev-ci", DisabledReason: WebDisabledReasonMissingAssets},
+		{Capabilities: []string{"web-ui-v1"}, DisabledReason: WebDisabledReasonMissingAssets},
+	} {
+		err := WriteRuntime(
+			DaemonEndpoint{Network: "tcp", Address: defaultTestAddr}, nil, "test-version", browser,
+		)
+		require.ErrorContains(t, err, "disabled reason")
+	}
+}
+
+func TestRuntimeInfoIgnoresDisabledReasonAlongsideOrigin(t *testing.T) {
+	rec := kitdaemon.NewRuntimeRecord(
+		daemonServiceName, "test-version",
+		DaemonEndpoint{Network: "tcp", Address: defaultTestAddr}.kitEndpoint(),
+	)
+	rec.Metadata = map[string]string{
+		runtimeWebOriginKey:         "http://127.0.0.1:7400",
+		runtimeWebDisabledReasonKey: WebDisabledReasonMissingAssets,
+	}
+	info := runtimeInfoFromRecord(rec)
+	assert.Equal(t, "http://127.0.0.1:7400", info.WebOrigin)
+	assert.Empty(t, info.WebDisabledReason)
+}
+
+func TestKillDaemonCleansRuntimeForNonRoborevPIDWithoutShutdown(t *testing.T) {
+	testenv.SetDataDir(t)
 	// Verify that isLoopbackAddr correctly rejects non-loopback addresses,
 	// which prevents KillDaemon from making HTTP requests to them.
 	if isLoopbackAddr("192.168.1.100:7373") {
@@ -221,22 +341,18 @@ func TestKillDaemonSkipsHTTPForNonLoopback(t *testing.T) {
 		return processNotRoborev
 	})
 
-	// KillDaemon with a non-loopback address should skip HTTP and fall
-	// through to killProcess (which returns true because of the mock).
-	// This must complete promptly without attempting network connections.
+	runtimePath := filepath.Join(t.TempDir(), "daemon.json")
+	require.NoError(t, os.WriteFile(runtimePath, []byte("{}"), 0o600))
 	info := &RuntimeInfo{
-		PID:     os.Getpid(),          // Existing PID, but mocked as not-roborev
-		Address: "192.168.1.100:7373", // Non-loopback address
+		PID:        os.Getpid(),          // Existing PID, but mocked as not-roborev
+		Address:    "192.168.1.100:7373", // Non-loopback address
+		SourcePath: runtimePath,
 	}
 
 	result := KillDaemon(info)
 
-	// killProcess confirms the process is not roborev, so KillDaemon returns true
-	if !result {
-		assert.Condition(t, func() bool {
-			return false
-		}, "KillDaemon should return true for process confirmed not roborev")
-	}
+	assert.True(t, result)
+	assert.NoFileExists(t, runtimePath)
 }
 
 func TestListAllRuntimesSkipsUnreadableFiles(t *testing.T) {
@@ -315,40 +431,6 @@ func TestIdentifyProcessTriState(t *testing.T) {
 	}
 }
 
-func TestKillProcessConservativeOnUnknown(t *testing.T) {
-	// Test that killProcess is conservative when process identity is unknown
-	// Using a very high PID that almost certainly doesn't exist
-	nonExistentPID := math.MaxInt32
-
-	// killProcess should return true for non-existent PID (process is dead)
-	// This is safe because the process doesn't exist at all
-	result := killProcess(nonExistentPID)
-	if !result {
-		assert.Condition(t, func() bool {
-			return false
-		}, "killProcess should return true for non-existent PID")
-	}
-}
-
-func TestKillProcessUnknownIdentityIsConservative(t *testing.T) {
-	// Mock identifyProcess to always return unknown
-	mockIdentifyProcess(t, func(pid int) processIdentity {
-		return processUnknown
-	})
-
-	// Use current process PID (definitely exists)
-	currentPID := os.Getpid()
-
-	// killProcess should return false (conservative - don't clean up)
-	// when identity is unknown for a live process
-	result := killProcess(currentPID)
-	if result {
-		assert.Condition(t, func() bool {
-			return false
-		}, "killProcess should return false (conservative) when identity is unknown for live process")
-	}
-}
-
 func TestIsLoopbackAddr(t *testing.T) {
 	tests := []struct {
 		addr string
@@ -419,9 +501,8 @@ func TestProbeDaemonPrefersPing(t *testing.T) {
 func TestCleanupZombieDaemonsPreservesTargetSocket(t *testing.T) {
 	// Regression test: when a zombie's socket matches the target
 	// (e.g. a systemd-managed socket), cleanup must remove the
-	// runtime file but preserve the socket — even when killProcess
-	// returns true because the PID was reused by a non-roborev
-	// process.
+	// runtime file but preserve the socket when the PID was reused by a
+	// non-roborev process.
 	if runtime.GOOS == "windows" {
 		t.Skip("Unix sockets not supported on Windows")
 	}
@@ -471,6 +552,30 @@ func TestCleanupZombieDaemonsPreservesTargetSocket(t *testing.T) {
 	assert.FileExists(socketPath, "target socket must be preserved")
 }
 
+func TestCleanupZombieDaemonsPreservesIdentifiedLiveLegacyDaemon(t *testing.T) {
+	dataDir := testenv.SetDataDir(t)
+	addr, mux := startMockDaemon(t)
+	shutdownCalled := make(chan struct{}, 1)
+	mux.HandleFunc("/api/shutdown", func(w http.ResponseWriter, r *http.Request) {
+		shutdownCalled <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+	})
+	legacyPath := writeLegacyRuntimeFile(
+		t, dataDir, fmt.Sprintf("daemon.%d.json", os.Getpid()),
+		os.Getpid(), addr,
+	)
+	mockIdentifyProcess(t, func(pid int) processIdentity {
+		assert.Equal(t, os.Getpid(), pid)
+		return processIsRoborev
+	})
+
+	cleaned := CleanupZombieDaemons(DaemonEndpoint{})
+
+	assert.Zero(t, cleaned)
+	assert.FileExists(t, legacyPath)
+	assert.Empty(t, shutdownCalled)
+}
+
 func TestRuntimeInfo_Endpoint(t *testing.T) {
 	assert := assert.New(t)
 
@@ -490,6 +595,139 @@ func TestRuntimeInfo_Endpoint(t *testing.T) {
 	info = RuntimeInfo{PID: 1, Address: "127.0.0.1:7373", Network: ""}
 	ep = info.Endpoint()
 	assert.Equal("tcp", ep.Network)
+}
+
+func TestRuntimeInfoEndpoints(t *testing.T) {
+	t.Run("primary only", func(t *testing.T) {
+		info := RuntimeInfo{Network: "tcp", Address: defaultTestAddr}
+		assert.Equal(t, []DaemonEndpoint{{Network: "tcp", Address: defaultTestAddr}}, info.Endpoints())
+	})
+
+	t.Run("valid alternate", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("Unix sockets are not supported on Windows")
+		}
+		alternatePath := "/tmp/rr-runtime-alt.sock"
+		info := RuntimeInfo{
+			Network:          "tcp",
+			Address:          defaultTestAddr,
+			AlternateNetwork: "unix",
+			AlternateAddress: alternatePath,
+		}
+		assert.Equal(t, []DaemonEndpoint{
+			{Network: "tcp", Address: defaultTestAddr},
+			{Network: "unix", Address: alternatePath},
+		}, info.Endpoints())
+	})
+
+	t.Run("incomplete alternate", func(t *testing.T) {
+		info := RuntimeInfo{
+			Network:          "tcp",
+			Address:          defaultTestAddr,
+			AlternateNetwork: "unix",
+		}
+		assert.Equal(t, []DaemonEndpoint{{Network: "tcp", Address: defaultTestAddr}}, info.Endpoints())
+	})
+
+	t.Run("non-loopback alternate", func(t *testing.T) {
+		info := RuntimeInfo{
+			Network:          "tcp",
+			Address:          defaultTestAddr,
+			AlternateNetwork: "tcp",
+			AlternateAddress: "192.0.2.1:7373",
+		}
+		assert.Equal(t, []DaemonEndpoint{{Network: "tcp", Address: defaultTestAddr}}, info.Endpoints())
+	})
+
+	t.Run("duplicate alternate", func(t *testing.T) {
+		info := RuntimeInfo{
+			Network:          "tcp",
+			Address:          defaultTestAddr,
+			AlternateNetwork: "tcp",
+			AlternateAddress: defaultTestAddr,
+		}
+		assert.Equal(t, []DaemonEndpoint{{Network: "tcp", Address: defaultTestAddr}}, info.Endpoints())
+	})
+}
+
+func TestDiscoverRuntimeRecords(t *testing.T) {
+	const alternateAddr = "127.0.0.1:7374"
+	record := kitdaemon.RuntimeRecord{
+		PID:     42,
+		Network: "tcp",
+		Address: defaultTestAddr,
+		Metadata: map[string]string{
+			runtimeAlternateNetworkKey: "tcp",
+			runtimeAlternateAddressKey: alternateAddr,
+		},
+	}
+	denied := &net.OpError{Op: "dial", Net: "tcp", Err: syscall.EPERM}
+
+	t.Run("falls back after primary access denied", func(t *testing.T) {
+		got, err := discoverRuntimeRecords(t.Context(), []kitdaemon.RuntimeRecord{record}, func(_ context.Context, ep DaemonEndpoint) (*PingInfo, error) {
+			if ep.Address == defaultTestAddr {
+				return nil, denied
+			}
+			return &PingInfo{OK: true, Service: daemonServiceName, PID: record.PID}, nil
+		})
+
+		require.NoError(t, err)
+		assert.Equal(t, "tcp", got.Network)
+		assert.Equal(t, alternateAddr, got.Address)
+	})
+
+	t.Run("preserves access denied after every endpoint fails", func(t *testing.T) {
+		_, err := discoverRuntimeRecords(t.Context(), []kitdaemon.RuntimeRecord{record}, func(context.Context, DaemonEndpoint) (*PingInfo, error) {
+			return nil, denied
+		})
+
+		require.ErrorIs(t, err, ErrDaemonAccessDenied)
+	})
+
+	t.Run("ordinary failures mean not found", func(t *testing.T) {
+		_, err := discoverRuntimeRecords(t.Context(), []kitdaemon.RuntimeRecord{record}, func(context.Context, DaemonEndpoint) (*PingInfo, error) {
+			return nil, errors.New("connection refused")
+		})
+
+		require.ErrorIs(t, err, os.ErrNotExist)
+	})
+
+	for name, pingPID := range map[string]int{
+		"missing ping PID":    0,
+		"mismatched ping PID": record.PID + 1,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := discoverRuntimeRecords(t.Context(), []kitdaemon.RuntimeRecord{record}, func(context.Context, DaemonEndpoint) (*PingInfo, error) {
+				return &PingInfo{OK: true, Service: daemonServiceName, PID: pingPID}, nil
+			})
+
+			require.ErrorIs(t, err, os.ErrNotExist)
+		})
+	}
+}
+
+func TestCleanupZombieDaemonsPreservesAccessDeniedRuntime(t *testing.T) {
+	testenv.SetDataDir(t)
+	socketDir := t.TempDir()
+	socketPath := filepath.Join(socketDir, "daemon.sock")
+	require.NoError(t, os.WriteFile(socketPath, nil, 0o600))
+
+	primary := DaemonEndpoint{Network: "tcp", Address: defaultTestAddr}
+	alternate := DaemonEndpoint{Network: "unix", Address: socketPath}
+	require.NoError(t, WriteRuntime(primary, &alternate, "test-version", nil))
+	runtimePath := RuntimePath()
+
+	origProbe := probeRuntimeEndpoint
+	probeRuntimeEndpoint = func(context.Context, DaemonEndpoint) (*PingInfo, error) {
+		return nil, &net.OpError{Op: "dial", Net: "local", Err: syscall.EPERM}
+	}
+	t.Cleanup(func() { probeRuntimeEndpoint = origProbe })
+
+	cleaned := CleanupZombieDaemons(primary)
+
+	assert.Zero(t, cleaned)
+	assert.FileExists(t, runtimePath)
+	assert.FileExists(t, socketPath)
 }
 
 func TestListAllRuntimesWithGlobMetacharacters(t *testing.T) {
@@ -613,7 +851,7 @@ func TestListLegacyRuntimesSkipsMalformedFiles(t *testing.T) {
 	assert.Empty(runtimes)
 }
 
-func TestKillDaemonStopsLegacyDaemonGracefully(t *testing.T) {
+func TestKillDaemonCleansDeadLegacyRuntimeWithoutContactingEndpoint(t *testing.T) {
 	assert := assert.New(t)
 	dataDir := testenv.SetDataDir(t)
 
@@ -634,6 +872,138 @@ func TestKillDaemonStopsLegacyDaemonGracefully(t *testing.T) {
 	require.Len(t, runtimes, 1)
 
 	assert.True(KillDaemon(runtimes[0]))
-	assert.True(shutdownCalled, "graceful shutdown endpoint must be tried first")
+	assert.False(shutdownCalled, "a stale runtime must not stop a replacement endpoint")
 	assert.NoFileExists(legacyPath, "legacy runtime file must be cleaned up")
+}
+
+func TestKillDaemonReturnsWhenKnownProcessExitsAndEndpointIsReused(t *testing.T) {
+	testenv.SetDataDir(t)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/shutdown", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/api/ping", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(PingInfo{
+			OK:      true,
+			Service: daemonServiceName,
+			PID:     123,
+		})
+	})
+	server := httptest.NewServer(mux)
+
+	done := make(chan bool, 1)
+	go func() {
+		done <- KillDaemon(&RuntimeInfo{
+			PID:     math.MaxInt32,
+			Network: "tcp",
+			Address: strings.TrimPrefix(server.URL, "http://"),
+		})
+	}()
+
+	var result bool
+	completedWhileEndpointAlive := assert.Eventually(t, func() bool {
+		select {
+		case result = <-done:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, 10*time.Millisecond)
+	server.Close()
+	if !completedWhileEndpointAlive {
+		require.Eventually(t, func() bool {
+			select {
+			case result = <-done:
+				return true
+			default:
+				return false
+			}
+		}, 2*time.Second, 10*time.Millisecond)
+	}
+	assert.True(t, result)
+}
+
+func TestRequestGracefulDaemonShutdownUsesSharedContextForDelayedAcceptance(t *testing.T) {
+	var dead atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(50 * time.Millisecond)
+		dead.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	ep := DaemonEndpoint{Network: "tcp", Address: strings.TrimPrefix(server.URL, "http://")}
+
+	assert.True(t, requestGracefulDaemonShutdown(ctx, ep, dead.Load))
+}
+
+func TestRequestGracefulDaemonShutdownRetriesServerErrors(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) == 1 {
+			http.Error(w, "temporary drain failure", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ep := DaemonEndpoint{Network: "tcp", Address: strings.TrimPrefix(server.URL, "http://")}
+
+	assert.True(t, requestGracefulDaemonShutdown(ctx, ep, func() bool { return false }))
+	assert.Equal(t, int32(2), attempts.Load())
+}
+
+func TestKillDaemonCleansDeadRuntimeWhenEndpointIsUnavailable(t *testing.T) {
+	testenv.SetDataDir(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	address := listener.Addr().String()
+	require.NoError(t, listener.Close())
+
+	runtimePath := filepath.Join(t.TempDir(), "daemon.json")
+	require.NoError(t, os.WriteFile(runtimePath, []byte("{}"), 0o600))
+
+	stopped := KillDaemon(&RuntimeInfo{
+		PID:        math.MaxInt32,
+		Network:    "tcp",
+		Address:    address,
+		SourcePath: runtimePath,
+	})
+
+	assert.True(t, stopped)
+	assert.NoFileExists(t, runtimePath)
+}
+
+func TestKillDaemonDoesNotRemoveReusedUnixSocket(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix sockets not supported on Windows")
+	}
+	testenv.SetDataDir(t)
+	socketDir, err := os.MkdirTemp("/tmp", "rr-stop-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
+	socketPath := filepath.Join(socketDir, "daemon.sock")
+	listener, err := net.Listen("unix", socketPath)
+	require.NoError(t, err)
+	defer listener.Close()
+
+	runtimePath := filepath.Join(t.TempDir(), "daemon.json")
+	require.NoError(t, os.WriteFile(runtimePath, []byte("{}"), 0o600))
+
+	stopped := KillDaemon(&RuntimeInfo{
+		PID:        math.MaxInt32,
+		Network:    "unix",
+		Address:    socketPath,
+		SourcePath: runtimePath,
+	})
+
+	assert.True(t, stopped)
+	assert.NoFileExists(t, runtimePath)
+	assert.FileExists(t, socketPath)
 }

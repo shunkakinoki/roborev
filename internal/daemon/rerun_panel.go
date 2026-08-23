@@ -29,11 +29,16 @@ func isRerunnableStatus(status storage.JobStatus) bool {
 // the synthesis row into fresh queued jobs under a new panel_run_uuid, leaving
 // the original run intact as history. EnqueuePanelRun re-blocks the new
 // synthesis until the new members finish.
-func (s *Server) rerunPanelRun(job *storage.ReviewJob) (*RerunJobOutput, error) {
+func (s *Server) rerunPanelRun(job *storage.ReviewJob, requestID string) (*RerunJobOutput, error) {
 	// Require the same terminal states as ReenqueueJob so a queued/running
 	// synthesis cannot be rerun into a second active run alongside the original.
 	if !isRerunnableStatus(job.Status) {
 		return nil, huma.Error404NotFound("job not found or not rerunnable")
+	}
+	if panelRerunWorktreeIsInvalid(job) {
+		return nil, huma.Error400BadRequest(
+			"panel rerun worktree path is stale or invalid",
+		)
 	}
 	members, err := s.db.GetPanelMembers(job.PanelRunUUID)
 	if err != nil {
@@ -42,6 +47,23 @@ func (s *Server) rerunPanelRun(job *storage.ReviewJob) (*RerunJobOutput, error) 
 	}
 	if len(members) == 0 {
 		return nil, huma.Error400BadRequest("panel run has no members to rerun")
+	}
+	for i := range members {
+		if !isRerunnableStatus(members[i].Status) {
+			return nil, huma.Error409Conflict("panel member is not rerunnable")
+		}
+		// Successful and failed terminal jobs retain their historical worker ID.
+		// A canceled job is different: its worker may still be unwinding and
+		// using the shared worktree until ReleaseCanceledJobWorker clears the
+		// ownership marker.
+		if members[i].Status == storage.JobStatusCanceled && members[i].WorkerID != "" {
+			return nil, huma.Error409Conflict("panel member is still stopping")
+		}
+		if panelRerunWorktreeIsInvalid(&members[i]) {
+			return nil, huma.Error400BadRequest(
+				"panel rerun worktree path is stale or invalid",
+			)
+		}
 	}
 	source, err := s.panelRerunSource(job)
 	if err != nil {
@@ -77,14 +99,26 @@ func (s *Server) rerunPanelRun(job *storage.ReviewJob) (*RerunJobOutput, error) 
 	}
 	synthOpts := panelRerunSynthesisOpts(job, runUUID, synthDiff, synthDirtyFiles, source)
 
-	if _, _, err := s.db.EnqueuePanelRun(memberOpts, synthOpts); err != nil {
+	_, synthJob, replayed, err := s.db.EnqueuePanelRerun(memberOpts, synthOpts, requestID, job.ID)
+	if err != nil {
 		return nil, huma.Error500InternalServerError(
 			fmt.Sprintf("enqueue rerun panel: %v", err))
+	}
+	if !replayed {
+		s.broadcastRerunEnqueued(synthJob.ID, synthJob.UUID, job)
 	}
 
 	resp := &RerunJobOutput{}
 	resp.Body.Success = true
+	resp.Body.JobID = synthJob.ID
+	resp.Body.RequestID = requestID
+	resp.Body.RunUUID = synthJob.PanelRunUUID
 	return resp, nil
+}
+
+func panelRerunWorktreeIsInvalid(job *storage.ReviewJob) bool {
+	return job.WorktreePath != "" &&
+		validatedWorktreePath(job.WorktreePath, job.RepoPath) == ""
 }
 
 func (s *Server) panelRerunSource(job *storage.ReviewJob) (string, error) {

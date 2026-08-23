@@ -3,12 +3,15 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	kitdaemon "go.kenn.io/kit/daemon"
@@ -16,16 +19,60 @@ import (
 	"go.kenn.io/roborev/internal/config"
 )
 
-const daemonServiceName = "roborev"
+const (
+	daemonServiceName           = "roborev"
+	runtimeAlternateNetworkKey  = "alternate_network"
+	runtimeAlternateAddressKey  = "alternate_address"
+	runtimeWebAddressKey        = "web_address"
+	runtimeWebOriginKey         = "web_origin"
+	runtimeWebBasePathKey       = "web_base_path"
+	runtimeWebCapabilitiesKey   = "web_capabilities"
+	runtimeWebDisabledReasonKey = "web_disabled_reason"
+)
+
+// Reasons the daemon publishes when the browser listener is not running, so
+// CLI commands can tell users how to get the web UI back.
+const (
+	// WebDisabledReasonConfig means [web] enabled = false in the config.
+	WebDisabledReasonConfig = "config"
+	// WebDisabledReasonMissingAssets means this binary was built without the
+	// production web assets and cannot serve the browser application.
+	WebDisabledReasonMissingAssets = "missing-web-assets"
+)
+
+// ErrDaemonAccessDenied means a daemon runtime was found but local permissions
+// prevented every usable endpoint from being probed.
+var ErrDaemonAccessDenied = errors.New("daemon access denied")
+
+var probeRuntimeEndpoint = probeRuntimeRecord
 
 // RuntimeInfo stores daemon runtime state
 type RuntimeInfo struct {
-	PID        int    `json:"pid"`
-	Network    string `json:"network,omitempty"`
-	Address    string `json:"address"`
-	Service    string `json:"service,omitempty"`
-	Version    string `json:"version,omitempty"`
-	SourcePath string `json:"-"` // Path to the runtime file (not serialized, set by ListAllRuntimes)
+	PID               int      `json:"pid"`
+	Network           string   `json:"network,omitempty"`
+	Address           string   `json:"address"`
+	Service           string   `json:"service,omitempty"`
+	Version           string   `json:"version,omitempty"`
+	SourcePath        string   `json:"-"` // Path to the runtime file (not serialized, set by ListAllRuntimes)
+	AlternateNetwork  string   `json:"-"`
+	AlternateAddress  string   `json:"-"`
+	WebAddress        string   `json:"-"`
+	WebOrigin         string   `json:"-"`
+	WebBasePath       string   `json:"-"`
+	WebCapabilities   []string `json:"-"`
+	WebDisabledReason string   `json:"-"`
+}
+
+// BrowserRuntimeInfo is the non-secret discovery information published for
+// the daemon's optional browser listener. When the listener is not running,
+// DisabledReason carries the machine-readable cause and all other fields are
+// empty.
+type BrowserRuntimeInfo struct {
+	Address        string
+	Origin         string
+	WebBasePath    string
+	Capabilities   []string
+	DisabledReason string
 }
 
 // Endpoint returns a DaemonEndpoint for this runtime.
@@ -37,6 +84,31 @@ func (r RuntimeInfo) Endpoint() DaemonEndpoint {
 		Service: r.Service,
 		Version: r.Version,
 	}.Endpoint())
+}
+
+// Endpoints returns the primary endpoint followed by a valid distinct
+// alternate endpoint published in runtime metadata.
+func (r RuntimeInfo) Endpoints() []DaemonEndpoint {
+	primary := r.Endpoint()
+	endpoints := []DaemonEndpoint{primary}
+	if r.AlternateNetwork == "" || r.AlternateAddress == "" {
+		return endpoints
+	}
+
+	var raw string
+	switch r.AlternateNetwork {
+	case "tcp":
+		raw = r.AlternateAddress
+	case "unix":
+		raw = "unix://" + r.AlternateAddress
+	default:
+		return endpoints
+	}
+	alternate, err := ParseEndpoint(raw)
+	if err != nil || alternate == primary {
+		return endpoints
+	}
+	return append(endpoints, alternate)
 }
 
 // PingInfo is the minimal daemon identity payload used for liveness probes.
@@ -72,14 +144,27 @@ func DiscoverOptions(timeout time.Duration) kitdaemon.DiscoverOptions {
 
 func runtimeInfoFromRecord(rec kitdaemon.RuntimeRecord) *RuntimeInfo {
 	ep := daemonEndpointFromKit(rec.Endpoint())
-	return &RuntimeInfo{
-		PID:        rec.PID,
-		Network:    ep.Network,
-		Address:    ep.Address,
-		Service:    rec.Service,
-		Version:    rec.Version,
-		SourcePath: rec.SourcePath,
+	info := &RuntimeInfo{
+		PID:              rec.PID,
+		Network:          ep.Network,
+		Address:          ep.Address,
+		Service:          rec.Service,
+		Version:          rec.Version,
+		SourcePath:       rec.SourcePath,
+		AlternateNetwork: rec.Metadata[runtimeAlternateNetworkKey],
+		AlternateAddress: rec.Metadata[runtimeAlternateAddressKey],
+		WebAddress:       rec.Metadata[runtimeWebAddressKey],
+		WebOrigin:        rec.Metadata[runtimeWebOriginKey],
+		WebBasePath:      rec.Metadata[runtimeWebBasePathKey],
 	}
+	info.WebDisabledReason = rec.Metadata[runtimeWebDisabledReasonKey]
+	if info.WebOrigin != "" {
+		info.WebDisabledReason = ""
+	}
+	if raw := rec.Metadata[runtimeWebCapabilitiesKey]; raw != "" {
+		info.WebCapabilities = strings.Split(raw, ",")
+	}
+	return info
 }
 
 func pingInfoFromKit(info kitdaemon.PingInfo) *PingInfo {
@@ -107,10 +192,65 @@ func RuntimePathForPID(pid int) string {
 
 // WriteRuntime saves the daemon runtime info atomically.
 // Uses write-to-temp-then-rename to prevent readers from seeing partial writes.
-func WriteRuntime(ep DaemonEndpoint, version string) error {
-	rec := kitdaemon.NewRuntimeRecord(daemonServiceName, version, ep.kitEndpoint())
+func WriteRuntime(primary DaemonEndpoint, alternate *DaemonEndpoint, version string, browser *BrowserRuntimeInfo) error {
+	rec := kitdaemon.NewRuntimeRecord(daemonServiceName, version, primary.kitEndpoint())
+	rec.Metadata = make(map[string]string)
+	if alternate != nil {
+		info := RuntimeInfo{
+			Network:          primary.Network,
+			Address:          primary.Address,
+			AlternateNetwork: alternate.Network,
+			AlternateAddress: alternate.Address,
+		}
+		if len(info.Endpoints()) == 2 {
+			rec.Metadata[runtimeAlternateNetworkKey] = alternate.Network
+			rec.Metadata[runtimeAlternateAddressKey] = alternate.Address
+		}
+	}
+	if browser != nil && browser.DisabledReason != "" {
+		if browser.Address != "" || browser.Origin != "" ||
+			browser.WebBasePath != "" || len(browser.Capabilities) > 0 {
+			return fmt.Errorf("browser runtime cannot carry both listener fields and a disabled reason")
+		}
+		rec.Metadata[runtimeWebDisabledReasonKey] = browser.DisabledReason
+	} else if browser != nil {
+		if err := validateBrowserRuntime(*browser); err != nil {
+			return err
+		}
+		rec.Metadata[runtimeWebAddressKey] = browser.Address
+		rec.Metadata[runtimeWebOriginKey] = browser.Origin
+		rec.Metadata[runtimeWebBasePathKey] = browser.WebBasePath
+		rec.Metadata[runtimeWebCapabilitiesKey] = strings.Join(browser.Capabilities, ",")
+	}
+	if len(rec.Metadata) == 0 {
+		rec.Metadata = nil
+	}
 	_, err := runtimeStore().Write(rec)
 	return err
+}
+
+func validateBrowserRuntime(browser BrowserRuntimeInfo) error {
+	if strings.TrimSpace(browser.Address) == "" || strings.TrimSpace(browser.Origin) == "" {
+		return fmt.Errorf("browser runtime address and origin are required")
+	}
+	basePath, err := config.NormalizeWebBasePath(browser.WebBasePath)
+	if err != nil {
+		return fmt.Errorf("browser runtime base path: %w", err)
+	}
+	if basePath != browser.WebBasePath {
+		return fmt.Errorf("browser runtime base path is not canonical")
+	}
+	seen := make(map[string]struct{}, len(browser.Capabilities))
+	for _, capability := range browser.Capabilities {
+		if capability == "" || capability != strings.TrimSpace(capability) || strings.Contains(capability, ",") {
+			return fmt.Errorf("invalid browser capability %q", capability)
+		}
+		if _, found := seen[capability]; found {
+			return fmt.Errorf("duplicate browser capability %q", capability)
+		}
+		seen[capability] = struct{}{}
+	}
+	return nil
 }
 
 // ReadRuntime reads the daemon runtime info for the current process
@@ -218,23 +358,83 @@ func listLegacyRuntimes() []*RuntimeInfo {
 	return runtimes
 }
 
-// GetAnyRunningDaemon returns info about a responsive daemon.
-// Returns os.ErrNotExist if no responsive daemon is found.
-func GetAnyRunningDaemon() (*RuntimeInfo, error) {
-	rec, _, ok, err := kitdaemon.Discover(context.Background(), runtimeStore(), kitdaemon.DiscoverOptions{
-		Probe: kitdaemon.ProbeOptions{
-			ExpectedService: daemonServiceName,
-			Timeout:         time.Second,
-		},
+func probeRuntimeRecord(ctx context.Context, ep DaemonEndpoint) (*PingInfo, error) {
+	if ep.Address == "" {
+		return nil, fmt.Errorf("empty daemon address")
+	}
+	if !ep.IsUnix() && !isLoopbackAddr(ep.Address) {
+		return nil, fmt.Errorf("non-loopback daemon address: %s", ep.Address)
+	}
+	info, err := kitdaemon.Probe(ctx, ep.kitEndpoint(), kitdaemon.ProbeOptions{
+		ExpectedService: daemonServiceName,
+		Timeout:         time.Second,
 	})
 	if err != nil {
 		return nil, err
 	}
-	if ok {
-		return runtimeInfoFromRecord(rec), nil
-	}
+	return pingInfoFromKit(info), nil
+}
 
+// IsDaemonAccessDenied reports whether err is roborev's access-denied sentinel
+// or an operating-system permission error from a local endpoint probe.
+func IsDaemonAccessDenied(err error) bool {
+	return errors.Is(err, ErrDaemonAccessDenied) ||
+		errors.Is(err, os.ErrPermission) ||
+		errors.Is(err, syscall.EACCES) ||
+		errors.Is(err, syscall.EPERM)
+}
+
+func discoverRuntimeRecords(
+	ctx context.Context,
+	records []kitdaemon.RuntimeRecord,
+	probe func(context.Context, DaemonEndpoint) (*PingInfo, error),
+) (*RuntimeInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var deniedErr error
+	for _, rec := range records {
+		info := runtimeInfoFromRecord(rec)
+		primary := info.Endpoint()
+		for _, ep := range info.Endpoints() {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			ping, err := probe(ctx, ep)
+			if err == nil && ping != nil && ping.PID != 0 && ping.PID == rec.PID {
+				info.Network = ep.Network
+				info.Address = ep.Address
+				if ep != primary {
+					info.AlternateNetwork = primary.Network
+					info.AlternateAddress = primary.Address
+				}
+				return info, nil
+			}
+			if IsDaemonAccessDenied(err) {
+				deniedErr = fmt.Errorf("%w at %s: %w", ErrDaemonAccessDenied, ep, err)
+			}
+		}
+	}
+	if deniedErr != nil {
+		return nil, deniedErr
+	}
 	return nil, os.ErrNotExist
+}
+
+// GetAnyRunningDaemonContext returns info about a responsive daemon.
+// Returns os.ErrNotExist if no responsive daemon is found.
+func GetAnyRunningDaemonContext(ctx context.Context) (*RuntimeInfo, error) {
+	records, err := runtimeStore().List()
+	if err != nil {
+		return nil, err
+	}
+	return discoverRuntimeRecords(ctx, records, probeRuntimeEndpoint)
+}
+
+// GetAnyRunningDaemon returns info about a responsive daemon.
+// Returns os.ErrNotExist if no responsive daemon is found.
+func GetAnyRunningDaemon() (*RuntimeInfo, error) {
+	return GetAnyRunningDaemonContext(context.Background())
 }
 
 // ProbeDaemon validates that a daemon endpoint is serving the roborev daemon.
@@ -255,25 +455,49 @@ func ProbeDaemon(ep DaemonEndpoint, timeout time.Duration) (*PingInfo, error) {
 	return pingInfoFromKit(info), nil
 }
 
-// IsDaemonAlive checks if a daemon at the given endpoint is actually responding.
+// ProbeDaemonAlive checks if a daemon at the given endpoint is actually responding.
 // This is more reliable than checking PID and works cross-platform.
 // Only allows loopback addresses (for TCP) to prevent SSRF via malicious runtime files.
 // Uses retry logic to avoid misclassifying a slow or transiently failing daemon.
-func IsDaemonAlive(ep DaemonEndpoint) bool {
+func ProbeDaemonAlive(ep DaemonEndpoint) (bool, error) {
 	if ep.Address == "" {
-		return false
+		return false, nil
 	}
 
-	// Try up to 2 times with a short delay between attempts
+	var lastErr error
 	for attempt := range 2 {
 		if attempt > 0 {
 			time.Sleep(200 * time.Millisecond)
 		}
-		if _, err := ProbeDaemon(ep, 1*time.Second); err == nil {
-			return true
+		if _, err := probeRuntimeEndpoint(context.Background(), ep); err == nil {
+			return true, nil
+		} else if IsDaemonAccessDenied(err) {
+			return false, fmt.Errorf("%w at %s: %w", ErrDaemonAccessDenied, ep, err)
+		} else {
+			lastErr = err
 		}
 	}
-	return false
+	return false, lastErr
+}
+
+// IsDaemonAlive checks if a daemon at the given endpoint is actually responding.
+func IsDaemonAlive(ep DaemonEndpoint) bool {
+	alive, _ := ProbeDaemonAlive(ep)
+	return alive
+}
+
+func probeRuntimeAlive(info *RuntimeInfo) (bool, error) {
+	var deniedErr error
+	for _, ep := range info.Endpoints() {
+		alive, err := ProbeDaemonAlive(ep)
+		if alive {
+			return true, nil
+		}
+		if IsDaemonAccessDenied(err) {
+			deniedErr = err
+		}
+	}
+	return false, deniedErr
 }
 
 func parseDaemonBindAddr(addr string) (string, int, error) {
@@ -324,8 +548,8 @@ func isLoopbackAddr(addr string) bool {
 	return ip.IsLoopback()
 }
 
-// KillDaemon attempts to gracefully shut down a daemon, then force kill if needed.
-// Returns true if the daemon was killed or is no longer running.
+// KillDaemon requests graceful shutdown and waits until the daemon exits.
+// Returns true if the daemon is no longer running.
 // Only removes runtime file if the daemon is confirmed dead.
 func KillDaemon(info *RuntimeInfo) bool {
 	if info == nil {
@@ -334,12 +558,9 @@ func KillDaemon(info *RuntimeInfo) bool {
 
 	ep := info.Endpoint()
 
-	// Helper to remove the runtime file using SourcePath if available, otherwise by PID.
-	// Also cleans up Unix domain sockets.
+	// Remove only this process's runtime record. The endpoint may already belong
+	// to a service-manager replacement.
 	removeRuntimeFile := func() {
-		if ep.IsUnix() {
-			os.Remove(ep.Address)
-		}
 		if info.SourcePath != "" {
 			os.Remove(info.SourcePath)
 		} else if info.PID > 0 {
@@ -347,51 +568,98 @@ func KillDaemon(info *RuntimeInfo) bool {
 		}
 	}
 
-	// Confirmed dead means no ping response AND, when a PID is known, the
-	// process is gone. Legacy (pre-v0.57) daemons never answer /api/ping, so
-	// the HTTP check alone would declare them dead while they still run.
+	// When a PID is known, confirm that exact process exited. A service manager
+	// may start a replacement daemon on the same endpoint immediately.
 	confirmedDead := func() bool {
-		if info.PID > 0 && isProcessAlive(info.PID) {
-			return false
+		if info.PID > 0 {
+			return !isProcessAlive(info.PID)
 		}
 		return !IsDaemonAlive(ep)
 	}
-
-	// First try graceful HTTP shutdown
-	if ep.Address != "" {
-		client := ep.HTTPClient(2 * time.Second)
-		resp, err := client.Post(ep.BaseURL()+"/api/shutdown", "application/json", nil)
-		if err == nil {
-			resp.Body.Close()
-			// Wait for graceful shutdown
-			for range 10 {
-				time.Sleep(200 * time.Millisecond)
-				if confirmedDead() {
-					removeRuntimeFile()
-					return true
-				}
+	if confirmedDead() {
+		removeRuntimeFile()
+		return true
+	}
+	if info.PID > 0 {
+		switch identifyProcess(info.PID) {
+		case processNotRoborev:
+			removeRuntimeFile()
+			return true
+		case processUnknown:
+			ping, err := ProbeDaemon(ep, 2*time.Second)
+			if err != nil {
+				return false
+			}
+			if ping.PID != info.PID {
+				removeRuntimeFile()
+				return true
 			}
 		}
 	}
 
-	// HTTP shutdown failed or timed out, try OS-level kill
-	// Only do this if we have a valid PID
-	if info.PID > 0 {
-		if killProcess(info.PID) {
+	// Request graceful shutdown within one shared preparation budget. Once the
+	// daemon accepts the request, wait without a deadline for the exact process
+	// so running reviews still have unlimited time to finish.
+	if ep.Address != "" {
+		shutdownCleanupCtx, cancelShutdownCleanup := context.WithTimeout(
+			context.Background(), shutdownCleanupTimeout,
+		)
+		defer cancelShutdownCleanup()
+		if requestGracefulDaemonShutdown(shutdownCleanupCtx, ep, confirmedDead) {
+			waitForGracefulDaemonExit(200*time.Millisecond, confirmedDead)
 			removeRuntimeFile()
 			return true
 		}
-		// Kill failed - don't remove runtime file, daemon may still be running
-		return false
 	}
-
-	// No valid PID, just check if it's still alive
-	if ep.Address != "" && !IsDaemonAlive(ep) {
-		removeRuntimeFile()
-		return true
-	}
-
 	return false
+}
+
+func requestGracefulDaemonShutdown(
+	ctx context.Context,
+	ep DaemonEndpoint,
+	confirmedDead func() bool,
+) bool {
+	client := ep.HTTPClient(0)
+	for {
+		if confirmedDead() {
+			return true
+		}
+		req, err := http.NewRequestWithContext(
+			ctx, http.MethodPost, ep.BaseURL()+"/api/shutdown", nil,
+		)
+		if err != nil {
+			return false
+		}
+		resp, err := client.Do(req)
+		if err == nil {
+			accepted := resp.StatusCode >= http.StatusOK &&
+				resp.StatusCode < http.StatusMultipleChoices
+			retryable := resp.StatusCode >= http.StatusInternalServerError
+			resp.Body.Close()
+			if accepted {
+				return true
+			}
+			if !retryable {
+				return false
+			}
+		}
+		if confirmedDead() {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return confirmedDead()
+		case <-time.After(shutdownCleanupRetryInterval):
+		}
+	}
+}
+
+func waitForGracefulDaemonExit(
+	pollInterval time.Duration, confirmedDead func() bool,
+) {
+	for !confirmedDead() {
+		time.Sleep(pollInterval)
+	}
 }
 
 // CleanupZombieDaemons finds and kills all unresponsive daemons.
@@ -422,28 +690,30 @@ func CleanupZombieDaemons(target DaemonEndpoint) int {
 			continue
 		}
 
-		// Skip responsive daemons
-		if IsDaemonAlive(ep) {
+		alive, probeErr := probeRuntimeAlive(info)
+		if alive {
 			continue
 		}
-
-		// Unresponsive — try to kill it. When the zombie's
-		// socket matches the target (e.g. a systemd-managed
-		// socket we're about to serve on), kill the process
-		// and clean up the runtime file but preserve the socket.
-		if ep.IsUnix() && ep.Address == target.Address {
-			if info.PID > 0 && !killProcess(info.PID) {
-				// Could not confirm kill; leave runtime
-				// metadata so the next attempt can retry.
-				continue
+		if IsDaemonAccessDenied(probeErr) {
+			continue
+		}
+		if info.PID > 0 && identifyProcess(info.PID) == processNotRoborev {
+			if ep.IsUnix() && ep.Address != target.Address {
+				os.Remove(ep.Address)
 			}
 			if info.SourcePath != "" {
 				os.Remove(info.SourcePath)
-			} else if info.PID > 0 {
+			} else {
 				RemoveRuntimeForPID(info.PID)
 			}
 			cleaned++
-		} else if KillDaemon(info) {
+			continue
+		}
+
+		// Never stop an unresponsive live process during cleanup: it may be
+		// running a review. Records without a PID are safe to remove only when
+		// their endpoint is also confirmed dead.
+		if info.PID <= 0 && KillDaemon(info) {
 			cleaned++
 		}
 	}

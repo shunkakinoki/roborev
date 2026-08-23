@@ -22,9 +22,9 @@ type streamFormatterFixture struct {
 	f   *Formatter
 }
 
-func newFixture(tty bool) *streamFormatterFixture {
+func newFixture(tty bool, agent string) *streamFormatterFixture {
 	fix := &streamFormatterFixture{}
-	fix.f = New(&fix.buf, tty)
+	fix.f = New(&fix.buf, tty, DecoderForAgent(agent))
 	return fix
 }
 
@@ -87,9 +87,9 @@ type streamTestCase struct {
 	checkOutput func(*testing.T, *streamFormatterFixture)
 }
 
-func runStreamTestCase(t *testing.T, tc streamTestCase) {
+func runStreamTestCase(t *testing.T, agent string, tc streamTestCase) {
 	t.Run(tc.name, func(t *testing.T) {
-		fix := newFixture(true)
+		fix := newFixture(true, agent)
 		for _, event := range tc.events {
 			fix.writeLine(event)
 		}
@@ -113,7 +113,7 @@ func runStreamTestCase(t *testing.T, tc streamTestCase) {
 }
 
 func TestFormatterTTYRendersPlainText(t *testing.T) {
-	fix := newFixture(true)
+	fix := newFixture(true, "plain")
 
 	fix.writeLine("No issues found.")
 	fix.writeLine("Summary: Updates docs.")
@@ -402,7 +402,7 @@ func eventPiToolExecution(
 }
 
 func TestFormatter_NonTTY(t *testing.T) {
-	fix := newFixture(false)
+	fix := newFixture(false, "claude-code")
 	raw := `{"type":"assistant","message":{"content":[{"type":"text","text":"hello"}]}}`
 	fix.writeLine(raw)
 	require.Equal(t, raw+"\n", fix.output(),
@@ -416,7 +416,7 @@ func (errWriter) Write([]byte) (int, error) {
 }
 
 func TestFormatter_WriteError(t *testing.T) {
-	f := New(errWriter{}, true)
+	f := New(errWriter{}, true, DecoderForAgent("claude-code"))
 
 	line := eventAssistantText("hello") + "\n"
 	_, err := f.Write([]byte(line))
@@ -425,7 +425,7 @@ func TestFormatter_WriteError(t *testing.T) {
 }
 
 func TestFormatter_PartialWrites(t *testing.T) {
-	fix := newFixture(true)
+	fix := newFixture(true, "claude-code")
 
 	full := eventAssistantText("hello") + "\n"
 	_, _ = fix.f.Write([]byte(full[:20]))
@@ -596,7 +596,7 @@ func TestFormatter_Anthropic(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		runStreamTestCase(t, tc)
+		runStreamTestCase(t, "claude-code", tc)
 	}
 }
 
@@ -678,7 +678,7 @@ func TestFormatter_Gemini(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		runStreamTestCase(t, tc)
+		runStreamTestCase(t, "gemini", tc)
 	}
 }
 
@@ -908,7 +908,7 @@ func TestFormatter_OpenCode(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		runStreamTestCase(t, tc)
+		runStreamTestCase(t, "opencode", tc)
 	}
 }
 
@@ -1006,7 +1006,7 @@ func TestFormatter_CodexRendering(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		runStreamTestCase(t, tc)
+		runStreamTestCase(t, "codex", tc)
 	}
 }
 
@@ -1104,7 +1104,7 @@ func TestFormatter_PiRendering(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		runStreamTestCase(t, tc)
+		runStreamTestCase(t, "pi", tc)
 	}
 }
 
@@ -1161,9 +1161,11 @@ func TestRenderLogWithWrapsStderr(t *testing.T) {
 
 	input := strings.NewReader(longStderr + "\n")
 	var buf bytes.Buffer
-	fmtr := NewWithWidth(&buf, width, GlamourStyle())
+	fmtr := NewWithWidth(
+		&buf, width, GlamourStyle(), DecoderForAgent("plain"),
+	)
 
-	require.NoError(t, RenderLogWith(input, fmtr, &buf), "RenderLogWith failed")
+	require.NoError(t, RenderLogWith(input, fmtr), "RenderLogWith failed")
 
 	output := buf.String()
 	for line := range strings.SplitSeq(strings.TrimRight(output, "\n"), "\n") {
@@ -1176,7 +1178,9 @@ func TestRenderLogWithWrapsStderr(t *testing.T) {
 
 func TestFormatterWidth(t *testing.T) {
 	// Width() should return the configured terminal width.
-	fmtr := NewWithWidth(io.Discard, 42, GlamourStyle())
+	fmtr := NewWithWidth(
+		io.Discard, 42, GlamourStyle(), DecoderForAgent("plain"),
+	)
 	require.Equal(t, 42, fmtr.Width(), "Width() = %d, want 42", fmtr.Width())
 }
 

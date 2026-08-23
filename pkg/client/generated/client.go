@@ -59,6 +59,10 @@ type ClientInterface interface {
 	EnqueueJob(ctx context.Context, options *EnqueueJobRequestOptions, reqEditors ...runtime.RequestEditorFn) (*EnqueueJobResponseJSON, error)
 	EnqueueJobWithResponse(ctx context.Context, options *EnqueueJobRequestOptions, reqEditors ...runtime.RequestEditorFn) (*EnqueueJobResp, error)
 
+	// ExportCiCosts Export job-level CI costs
+	ExportCiCosts(ctx context.Context, options *ExportCiCostsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ExportCiCostsResponse, error)
+	ExportCiCostsWithResponse(ctx context.Context, options *ExportCiCostsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ExportCiCostsResp, error)
+
 	// ExportCiMetrics Export finalized CI panel metrics
 	ExportCiMetrics(ctx context.Context, options *ExportCiMetricsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ExportCiMetricsResponse, error)
 	ExportCiMetricsWithResponse(ctx context.Context, options *ExportCiMetricsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ExportCiMetricsResp, error)
@@ -178,6 +182,42 @@ type ClientInterface interface {
 	// BackfillTokens Backfill token usage from AgentsView payloads
 	BackfillTokens(ctx context.Context, options *BackfillTokensRequestOptions, reqEditors ...runtime.RequestEditorFn) (*BackfillTokensResponse, error)
 	BackfillTokensWithResponse(ctx context.Context, options *BackfillTokensRequestOptions, reqEditors ...runtime.RequestEditorFn) (*BackfillTokensResp, error)
+
+	// GetWebAnalytics Get a coherent SQLite analytics snapshot
+	GetWebAnalytics(ctx context.Context, options *GetWebAnalyticsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetWebAnalyticsResponse, error)
+	GetWebAnalyticsWithResponse(ctx context.Context, options *GetWebAnalyticsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetWebAnalyticsResp, error)
+
+	// GetReviewProjection Get a versioned read-only review projection
+	GetReviewProjection(ctx context.Context, options *GetReviewProjectionRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetReviewProjectionResponse, error)
+	GetReviewProjectionWithResponse(ctx context.Context, options *GetReviewProjectionRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetReviewProjectionResp, error)
+
+	// LogoutWebSession Invalidate a browser session
+	LogoutWebSession(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*struct{}, error)
+	LogoutWebSessionWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*LogoutWebSessionResp, error)
+
+	// GetWebSessionStatus Get browser authentication status
+	GetWebSessionStatus(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetWebSessionStatusResponse, error)
+	GetWebSessionStatusWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetWebSessionStatusResp, error)
+
+	// BootstrapWebSession Mint tab credentials from an ambient browser session
+	BootstrapWebSession(ctx context.Context, options *BootstrapWebSessionRequestOptions, reqEditors ...runtime.RequestEditorFn) (*BootstrapWebSessionResponse, error)
+	BootstrapWebSessionWithResponse(ctx context.Context, options *BootstrapWebSessionRequestOptions, reqEditors ...runtime.RequestEditorFn) (*BootstrapWebSessionResp, error)
+
+	// LoginWebSession Exchange a daemon token for a browser session
+	LoginWebSession(ctx context.Context, options *LoginWebSessionRequestOptions, reqEditors ...runtime.RequestEditorFn) (*LoginWebSessionResponse, error)
+	LoginWebSessionWithResponse(ctx context.Context, options *LoginWebSessionRequestOptions, reqEditors ...runtime.RequestEditorFn) (*LoginWebSessionResp, error)
+
+	// PrepareUpdate Prepare a leased update drain
+	PrepareUpdate(ctx context.Context, options *PrepareUpdateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PrepareUpdateResponse, error)
+	PrepareUpdateWithResponse(ctx context.Context, options *PrepareUpdateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PrepareUpdateResp, error)
+
+	// ReleaseUpdate Release an update drain lease
+	ReleaseUpdate(ctx context.Context, options *ReleaseUpdateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ReleaseUpdateResponse, error)
+	ReleaseUpdateWithResponse(ctx context.Context, options *ReleaseUpdateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ReleaseUpdateResp, error)
+
+	// RenewUpdate Renew an update drain lease
+	RenewUpdate(ctx context.Context, options *RenewUpdateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RenewUpdateResponse, error)
+	RenewUpdateWithResponse(ctx context.Context, options *RenewUpdateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RenewUpdateResp, error)
 }
 
 // ListActivity List recent daemon activity
@@ -637,6 +677,79 @@ func (c *Client) EnqueueJob(ctx context.Context, options *EnqueueJobRequestOptio
 	}
 
 	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/enqueue")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// ExportCiCosts Export job-level CI costs
+func (c *Client) ExportCiCosts(ctx context.Context, options *ExportCiCostsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ExportCiCostsResponse, error) {
+	var err error
+
+	queryEncoding := map[string]runtime.QueryEncoding{
+		"cursor": {Style: "form", Explode: &[]bool{false}[0]},
+		"format": {Style: "form", Explode: &[]bool{false}[0]},
+		"legacy": {Style: "form", Explode: &[]bool{false}[0]},
+		"limit":  {Style: "form", Explode: &[]bool{false}[0]},
+		"since":  {Style: "form", Explode: &[]bool{false}[0]},
+		"until":  {Style: "form", Explode: &[]bool{false}[0]},
+	}
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:    c.apiClient.GetBaseURL() + "/api/export/ci-costs",
+		Method:        "GET",
+		Options:       options,
+		QueryEncoding: queryEncoding,
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*ExportCiCostsResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(ExportCiCostsErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "ExportCiCostsErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(ExportCiCostsResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "ExportCiCostsResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/export/ci-costs")
 	if err != nil {
 		return nil, fmt.Errorf("error executing request: %w", err)
 	}
@@ -1451,8 +1564,10 @@ func (c *Client) ListJobs(ctx context.Context, options *ListJobsRequestOptions, 
 	queryEncoding := map[string]runtime.QueryEncoding{
 		"before":               {Style: "form", Explode: &[]bool{false}[0]},
 		"branch":               {Style: "form", Explode: &[]bool{false}[0]},
+		"branch_empty":         {Style: "form", Explode: &[]bool{false}[0]},
 		"branch_include_empty": {Style: "form", Explode: &[]bool{false}[0]},
 		"closed":               {Style: "form", Explode: &[]bool{false}[0]},
+		"cursor":               {Style: "form", Explode: &[]bool{false}[0]},
 		"exclude_job_type":     {Style: "form", Explode: &[]bool{false}[0]},
 		"git_ref":              {Style: "form", Explode: &[]bool{false}[0]},
 		"hide_classify_jobs":   {Style: "form", Explode: &[]bool{false}[0]},
@@ -2626,6 +2741,577 @@ func (c *Client) BackfillTokens(ctx context.Context, options *BackfillTokensRequ
 	}
 
 	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/tokens/backfill")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// GetWebAnalytics Get a coherent SQLite analytics snapshot
+func (c *Client) GetWebAnalytics(ctx context.Context, options *GetWebAnalyticsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetWebAnalyticsResponse, error) {
+	var err error
+
+	queryEncoding := map[string]runtime.QueryEncoding{
+		"agent":  {Style: "form", Explode: &[]bool{false}[0]},
+		"bucket": {Style: "form", Explode: &[]bool{false}[0]},
+		"model":  {Style: "form", Explode: &[]bool{false}[0]},
+		"since":  {Style: "form", Explode: &[]bool{false}[0]},
+		"until":  {Style: "form", Explode: &[]bool{false}[0]},
+	}
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:    c.apiClient.GetBaseURL() + "/api/ui/analytics",
+		Method:        "GET",
+		Options:       options,
+		QueryEncoding: queryEncoding,
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*GetWebAnalyticsResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(GetWebAnalyticsErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "GetWebAnalyticsErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(GetWebAnalyticsResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "GetWebAnalyticsResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/ui/analytics")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// GetReviewProjection Get a versioned read-only review projection
+func (c *Client) GetReviewProjection(ctx context.Context, options *GetReviewProjectionRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetReviewProjectionResponse, error) {
+	var err error
+
+	queryEncoding := map[string]runtime.QueryEncoding{
+		"branch": {Style: "form", Explode: &[]bool{false}[0]},
+		"job_id": {Style: "form", Explode: &[]bool{false}[0]},
+		"repo":   {Style: "form", Explode: &[]bool{false}[0]},
+	}
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:    c.apiClient.GetBaseURL() + "/api/ui/review-projection",
+		Method:        "GET",
+		Options:       options,
+		QueryEncoding: queryEncoding,
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*GetReviewProjectionResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(GetReviewProjectionErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "GetReviewProjectionErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(GetReviewProjectionResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "GetReviewProjectionResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/ui/review-projection")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// LogoutWebSession Invalidate a browser session
+func (c *Client) LogoutWebSession(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*struct{}, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/ui/session",
+		Method:     "DELETE",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*struct{}, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 204 {
+			target := new(LogoutWebSessionErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "LogoutWebSessionErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		return nil, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/ui/session")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// GetWebSessionStatus Get browser authentication status
+func (c *Client) GetWebSessionStatus(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetWebSessionStatusResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/ui/session",
+		Method:     "GET",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*GetWebSessionStatusResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(GetWebSessionStatusErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "GetWebSessionStatusErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(GetWebSessionStatusResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "GetWebSessionStatusResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/ui/session")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// BootstrapWebSession Mint tab credentials from an ambient browser session
+func (c *Client) BootstrapWebSession(ctx context.Context, options *BootstrapWebSessionRequestOptions, reqEditors ...runtime.RequestEditorFn) (*BootstrapWebSessionResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/ui/session/bootstrap",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*BootstrapWebSessionResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(BootstrapWebSessionErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "BootstrapWebSessionErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(BootstrapWebSessionResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "BootstrapWebSessionResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/ui/session/bootstrap")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// LoginWebSession Exchange a daemon token for a browser session
+func (c *Client) LoginWebSession(ctx context.Context, options *LoginWebSessionRequestOptions, reqEditors ...runtime.RequestEditorFn) (*LoginWebSessionResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/ui/session/login",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*LoginWebSessionResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(LoginWebSessionErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "LoginWebSessionErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(LoginWebSessionResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "LoginWebSessionResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/ui/session/login")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// PrepareUpdate Prepare a leased update drain
+func (c *Client) PrepareUpdate(ctx context.Context, options *PrepareUpdateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PrepareUpdateResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/update/prepare",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*PrepareUpdateResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(PrepareUpdateErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "PrepareUpdateErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(PrepareUpdateResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "PrepareUpdateResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/update/prepare")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// ReleaseUpdate Release an update drain lease
+func (c *Client) ReleaseUpdate(ctx context.Context, options *ReleaseUpdateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ReleaseUpdateResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/update/release",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*ReleaseUpdateResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(ReleaseUpdateErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "ReleaseUpdateErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(ReleaseUpdateResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "ReleaseUpdateResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/update/release")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// RenewUpdate Renew an update drain lease
+func (c *Client) RenewUpdate(ctx context.Context, options *RenewUpdateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RenewUpdateResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/update/renew",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*RenewUpdateResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(RenewUpdateErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "RenewUpdateErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(RenewUpdateResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "RenewUpdateResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/update/renew")
 	if err != nil {
 		return nil, fmt.Errorf("error executing request: %w", err)
 	}

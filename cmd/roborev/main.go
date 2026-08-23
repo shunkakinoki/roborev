@@ -61,6 +61,7 @@ func main() {
 	rootCmd.AddCommand(daemonCmd())
 	rootCmd.AddCommand(streamCmd())
 	rootCmd.AddCommand(tuiCmd())
+	rootCmd.AddCommand(uiCmd())
 	rootCmd.AddCommand(refineCmd())
 	rootCmd.AddCommand(runCmd())
 	rootCmd.AddCommand(analyzeCmd())
@@ -84,12 +85,12 @@ func main() {
 	rootCmd.AddCommand(backfillTokensCmd())
 	rootCmd.AddCommand(updateCmd())
 	rootCmd.AddCommand(versionCmd())
+	rootCmd.AddCommand(verifyWebAssetsCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		// exitError carries a specific exit code; the RunE that returned
 		// it has already silenced cobra's error printing via silentExit.
-		var exitErr *exitError
-		if errors.As(err, &exitErr) {
+		if exitErr, ok := errors.AsType[*exitError](err); ok {
 			os.Exit(exitErr.code)
 		}
 		// All other errors: cobra already printed them.

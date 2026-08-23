@@ -49,8 +49,19 @@ will be skipped.`,
 			}
 
 			agentsviewCandidates := make(map[int64]bool)
-			for _, job := range backfill.TokenCandidates(jobs) {
-				agentsviewCandidates[job.ID] = true
+			var candidateCursor int64
+			for {
+				page, err := db.ListTokenCostCandidates(candidateCursor, 1000, time.Time{})
+				if err != nil {
+					return fmt.Errorf("list cost candidates: %w", err)
+				}
+				if len(page) == 0 {
+					break
+				}
+				for _, candidate := range page {
+					agentsviewCandidates[candidate.JobID] = true
+				}
+				candidateCursor = page[len(page)-1].JobID
 			}
 			candidates := backfill.LogTokenCandidates(jobs)
 
@@ -58,9 +69,15 @@ will be skipped.`,
 			for _, job := range candidates {
 				total++
 
-				logUsage, logErr := tokens.ParseCodexUsageFile(
-					daemon.JobLogPath(job.ID),
+				var logUsage *tokens.Usage
+				currentLog, logErr := daemon.JobLogIsCurrentAttempt(
+					job.ID, job.StartedAt,
 				)
+				if logErr == nil && currentLog {
+					logUsage, logErr = tokens.ParseCodexUsageFile(
+						daemon.JobLogPath(job.ID),
+					)
+				}
 				if logErr != nil {
 					log.Printf(
 						"job %d: parse job log: %v", job.ID, logErr,
@@ -88,9 +105,7 @@ will be skipped.`,
 						continue
 					}
 				}
-				usage := backfill.MergeTokenUsage(
-					tokens.ToJSON(logUsage), fetchedUsage,
-				)
+				usage := backfill.MergeTokenUsage(tokens.ToJSON(logUsage), fetchedUsage)
 				if usage == nil {
 					skipped++
 					continue
@@ -106,18 +121,33 @@ will be skipped.`,
 					continue
 				}
 
-				j := tokens.ToJSON(mergedUsage)
 				sessionID := job.SessionID
 				if sessionID == "" {
 					sessionID = mergedUsage.ThreadID
 				}
-				if err := db.BackfillJobTokenUsage(job.ID, sessionID, j); err != nil {
+				stored, saved, err := backfill.StoreCapturedTokenUsage(
+					db,
+					backfill.CapturedUsage{
+						JobID:             job.ID,
+						SessionID:         sessionID,
+						ExistingJSON:      job.TokenUsage,
+						ExpectedStartedAt: job.StartedAtRaw,
+					},
+					logUsage,
+					fetchedUsage,
+				)
+				if err != nil {
 					log.Printf(
 						"job %d: save error: %v", job.ID, err,
 					)
 					failed++
 					continue
 				}
+				if !saved {
+					skipped++
+					continue
+				}
+				mergedUsage = stored
 				updated++
 				fmt.Printf(
 					"job %d (%s): %s\n",

@@ -1,41 +1,43 @@
 package agenthook
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
-func TestBuildOutputForStopBlocks(t *testing.T) {
-	output := BuildOutput(Input{HookEventName: "Stop"}, Response{
-		Triggered: true,
-		Reason:    "Invoke $roborev-fix.",
-	})
-
-	assert.Equal(t, "block", output["decision"])
-	assert.Contains(t, output["reason"], "Invoke $roborev-fix.")
-	assert.Contains(t, output["reason"], "continue the task")
-}
-
-func TestBuildOutputForPostToolUseAddsContext(t *testing.T) {
-	output := BuildOutput(Input{HookEventName: "PostToolUse"}, Response{
-		Triggered: true,
-		Reason:    "Invoke $roborev-fix.",
-	})
-
-	assert.NotContains(t, output, "decision")
-	specific, ok := output["hookSpecificOutput"].(map[string]any)
-	require.True(t, ok)
-	assert.Equal(t, "PostToolUse", specific["hookEventName"])
+func TestPostToolUseAdditionalContextPreservesResolvedInstruction(t *testing.T) {
 	assert.Equal(
 		t,
-		"Invoke $roborev-fix. If Roborev issues are found, fix them, "+
-			"then continue the task you were doing before this hook interrupted you.",
-		specific["additionalContext"],
+		"Invoke $roborev-fix.",
+		PostToolUseAdditionalContext("Invoke $roborev-fix."),
 	)
 }
 
-func TestBuildOutputWhenNotTriggeredIsEmpty(t *testing.T) {
-	assert.Empty(t, BuildOutput(Input{HookEventName: "Stop"}, Response{}))
+func TestPostToolUseAdditionalContextFallsBackToDefaultInstruction(t *testing.T) {
+	assert.Equal(t, DefaultInstruction, PostToolUseAdditionalContext(""))
+}
+
+// User policy must remain the final instruction so preceding workflow text
+// cannot override or dilute it.
+func TestStopReasonWithFixGuidelinesEndsWithPolicy(t *testing.T) {
+	got := StopReasonWithFixGuidelines("Resolve reviews.", "Verify before editing.")
+	assert.True(t, strings.HasSuffix(got, "Verify before editing."))
+	assert.Contains(t, got, "Resolve reviews.")
+}
+
+// If an untriggered response gains policy output, passive hook events begin
+// interrupting agent sessions.
+func TestBuildOutputWithFixGuidelinesKeepsUntriggeredOutputEmpty(t *testing.T) {
+	got := BuildOutputWithFixGuidelines(Input{HookEventName: "Stop"}, Response{}, "Verify first.")
+	assert.Empty(t, got)
+}
+
+// If the empty-policy path stops delegating to the old formatter, existing
+// hook registrations can observe a behavior change without opting in.
+func TestBuildOutputWithFixGuidelinesPreservesEmptyPolicyOutput(t *testing.T) {
+	input := Input{HookEventName: "PostToolUse"}
+	resp := Response{Triggered: true, Reason: "Resolve reviews."}
+	assert.Equal(t, BuildOutput(input, resp), BuildOutputWithFixGuidelines(input, resp, ""))
 }

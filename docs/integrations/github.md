@@ -666,8 +666,12 @@ outcome:
 | Outcome | Behavior |
 |---------|----------|
 | Transient provider outage or synthesis quota failure | Defers without a PR comment, keeps the status `pending`, and retries with exponential backoff. The first delay is 2 minutes, it doubles up to a 1 hour cap, and transient retries give up after 72 hours. |
-| Genuine member failure | Retries up to 3 consecutive genuine attempts. After that, roborev posts an all failed note and sets an `error` status. |
+| Genuine member failure | Retries up to 3 consecutive genuine attempts. After that, roborev posts a fixed `Review Unavailable` note and sets an `error` status. |
 | Quota or timeout skips only | Posts an all skipped summary and uses a nonblocking status. |
+
+The fixed genuine and transient give-up notices describe only the failure
+category. Agent errors and command output remain in local logs and state; they
+are not copied into pull request comments.
 
 If panel members produced review output but the synthesis agent hits quota or a
 transient provider failure, roborev now retries the panel instead of posting the
@@ -699,7 +703,7 @@ panel = "ci"                         # run named [review.panels.ci] for this rep
 # Or omit panel and use the compatible matrix:
 # agents = ["gemini"]
 # review_types = ["security", "default"]
-reasoning = "standard"               # override reasoning level (thorough, standard, fast)
+reasoning = "standard"               # override legacy or exact reasoning level
 ```
 
 Per-repo overrides take priority over the global `[ci]` config. Any field not
@@ -712,7 +716,7 @@ set, it takes priority over the matrix fields for that repo.
 | `agents` | array | global `agents` | Agents for CI reviews of this repo |
 | `review_types` | array | global `review_types` | Review types for CI reviews of this repo |
 | `reviews` | table | global `reviews` | Granular agent-to-review-type map (overrides `agents` and `review_types`; empty table disables reviews) |
-| `reasoning` | string | `"thorough"` | Reasoning level: `thorough`, `standard`, or `fast` |
+| `reasoning` | string | `"thorough"` | Legacy or exact reasoning level; see [Reasoning Levels](/configuration/#reasoning-levels) |
 | `min_severity` | string | `"low"` | Minimum severity to include: `low`, `medium`, `high`, or `critical` |
 | `upsert_comments` | bool | global `upsert_comments` | Override global comment upsert setting for this repo |
 | `include_costs` | bool | global `include_costs` | Include token cost estimates in PR comment footers for this repo |
@@ -1109,10 +1113,13 @@ The generated workflow triggers on `pull_request` events and:
 1. Checks out the PR branch with full history
 1. Downloads the pinned roborev binary and verifies its SHA256 checksum
 1. Runs `roborev ci review --comment` with the configured agents
-1. Posts review results as a PR comment
+1. Posts a PR comment only when an agent produced substantive review output
 
 In GitHub Actions, `ci review` reads `GITHUB_REPOSITORY`, `GITHUB_REF`, and
-`GITHUB_EVENT_PATH` automatically, so no flags are needed beyond `--comment`.
+`GITHUB_EVENT_PATH` automatically, so no flags are needed beyond `--comment`. An
+all-failed or empty-output run leaves its diagnostics in the Actions log without
+making a GitHub comment request. It exits nonzero for actionable failures; an
+all-quota batch keeps its existing successful exit.
 
 ### Customizing via `.roborev.toml`
 
@@ -1168,10 +1175,13 @@ jobs:
 ```
 
 Adjust the agent and secrets to match your setup. For multi-agent reviews, pass
-`--agent` multiple times or use `--review-types` to run different review types.
+a comma-separated list (`--agent codex,gemini`) or use `--review-types` to run
+different review types.
 
 ## See Also
 
+- [GitLab Integration](/integrations/gitlab/): The equivalent GitLab CI pipeline
+    setup
 - [Configuration](/configuration/): Global and per-repo settings
 - [Event Streaming](/advanced/streaming/): Stream review events for custom
     integrations

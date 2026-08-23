@@ -124,13 +124,31 @@ func WithCodexUserConfigIgnored(a Agent, ignored bool) Agent {
 func (a *CodexAgent) codexReasoningEffort() string {
 	switch a.Reasoning {
 	case ReasoningMaximum:
+		if codexModelSupportsMaxReasoning(a.Model) {
+			return "max"
+		}
 		return "xhigh"
-	case ReasoningThorough:
+	case ReasoningXHigh:
+		return "xhigh"
+	case ReasoningThorough, ReasoningHigh:
 		return "high"
-	case ReasoningFast:
+	case ReasoningMedium:
+		return "medium"
+	case ReasoningFast, ReasoningLow:
 		return "low"
+	case ReasoningMax:
+		return "max"
 	default:
 		return "" // use codex default
+	}
+}
+
+func codexModelSupportsMaxReasoning(model string) bool {
+	switch model {
+	case "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -325,7 +343,7 @@ func (a *CodexAgent) Review(ctx context.Context, repoPath, commitSHA, prompt str
 	if agenticMode {
 		supported, err := codexSupportsDangerousFlag(ctx, a.Command, runAgent.IgnoreUserConfig)
 		if err != nil {
-			return "", err
+			return "", MarkUnavailable(err)
 		}
 		if !supported {
 			return "", fmt.Errorf("codex does not support %s; upgrade codex or disable allow_unsafe_agents", codexDangerousFlag)
@@ -338,7 +356,7 @@ func (a *CodexAgent) Review(ctx context.Context, repoPath, commitSHA, prompt str
 	if !agenticMode {
 		supported, err := codexSupportsNonInteractive(ctx, a.Command, runAgent.IgnoreUserConfig)
 		if err != nil {
-			return "", err
+			return "", MarkUnavailable(err)
 		}
 		if !supported {
 			return "", fmt.Errorf("codex version too old for non-interactive execution; upgrade codex or use --agentic")
@@ -353,6 +371,7 @@ func (a *CodexAgent) Review(ctx context.Context, repoPath, commitSHA, prompt str
 		log.Printf("codex: sandbox disabled via config, using %s", codexAutoApproveFlag)
 	}
 	args := runAgent.buildArgs(repoPath, agenticMode, autoApprove, sandboxBroken)
+	stdoutDiagnostics := newCodexDiagnosticCapture()
 
 	runResult, runErr := runStreamingCLI(ctx, streamingCLISpec{
 		Name:         "codex",
@@ -363,20 +382,28 @@ func (a *CodexAgent) Review(ctx context.Context, repoPath, commitSHA, prompt str
 		Output:       output,
 		StreamStderr: true,
 		Parse: func(r io.Reader, sw *syncWriter) (string, error) {
-			return a.parseStreamJSON(r, sw)
+			return a.parseStreamJSON(io.TeeReader(r, stdoutDiagnostics), sw)
 		},
 	})
+	runResult.Stdout = stdoutDiagnostics.String()
 	if runErr != nil {
-		return "", runErr
+		return "", MarkUnavailable(runErr)
 	}
 
 	if runResult.WaitErr != nil {
+		if errors.Is(runResult.ParseErr, errNoCodexJSON) {
+			return "", markCodexNoJSONUnavailable(
+				formatCodexNoJSONWaitError(runResult), runResult.Stderr, stdoutDiagnostics,
+			)
+		}
 		return "", formatStreamingCLIWaitError("codex", runResult, runResult.Stderr)
 	}
 
 	if runResult.ParseErr != nil {
 		if errors.Is(runResult.ParseErr, errNoCodexJSON) {
-			return "", fmt.Errorf("codex CLI did not emit valid --json events; upgrade codex or check CLI compatibility: %w", errNoCodexJSON)
+			return "", markCodexNoJSONUnavailable(
+				formatCodexNoJSONError(runResult), runResult.Stderr, stdoutDiagnostics,
+			)
 		}
 		return "", runResult.ParseErr
 	}
@@ -386,6 +413,137 @@ func (a *CodexAgent) Review(ctx context.Context, repoPath, commitSHA, prompt str
 	}
 
 	return runResult.Result, nil
+}
+
+const codexDiagnosticClassificationChunk = 4096
+
+type codexDiagnosticCapture struct {
+	rendered       strings.Builder
+	tail           string
+	truncated      bool
+	classification LimitClassification
+}
+
+func newCodexDiagnosticCapture() *codexDiagnosticCapture {
+	return &codexDiagnosticCapture{}
+}
+
+func (c *codexDiagnosticCapture) Write(p []byte) (int, error) {
+	written := len(p)
+	captured := 0
+	if remaining := cliWaitErrorOutputLimit - c.rendered.Len(); remaining > 0 {
+		if len(p) < remaining {
+			remaining = len(p)
+		}
+		_, _ = c.rendered.Write(p[:remaining])
+		captured = remaining
+	}
+	if written > captured {
+		c.truncated = true
+	}
+
+	for len(p) > 0 {
+		chunkLen := min(len(p), codexDiagnosticClassificationChunk)
+		c.classifyChunk(string(p[:chunkLen]))
+		p = p[chunkLen:]
+	}
+	return written, nil
+}
+
+func (c *codexDiagnosticCapture) classifyChunk(chunk string) {
+	window := c.tail + chunk
+	c.classification = preferLimitClassification(
+		c.classification,
+		ClassifyLimit("codex", window),
+	)
+
+	overlap := maxLimitRuleSubstringLength("codex") - 1
+	if overlap <= 0 || len(window) <= overlap {
+		c.tail = window
+		return
+	}
+	c.tail = window[len(window)-overlap:]
+}
+
+func (c *codexDiagnosticCapture) String() string {
+	if c.truncated {
+		return c.rendered.String() + "..."
+	}
+	return c.rendered.String()
+}
+
+func (c *codexDiagnosticCapture) Classification() LimitClassification {
+	return c.classification
+}
+
+func markCodexNoJSONUnavailable(
+	err error,
+	stderr string,
+	stdoutDiagnostics *codexDiagnosticCapture,
+) error {
+	classification := preferLimitClassification(
+		stdoutDiagnostics.Classification(),
+		ClassifyLimit("codex", stderr),
+	)
+	return MarkUnavailable(WithLimitClassification(err, classification))
+}
+
+func maxLimitRuleSubstringLength(agentName string) int {
+	maxLength := 0
+	for _, rule := range defaultLimitRules {
+		if limitRuleAppliesToAgent(rule, agentName) && len(rule.Substring) > maxLength {
+			maxLength = len(rule.Substring)
+		}
+	}
+	return maxLength
+}
+
+func preferLimitClassification(current, candidate LimitClassification) LimitClassification {
+	priority := func(kind LimitKind) int {
+		switch kind {
+		case LimitKindQuota:
+			return 3
+		case LimitKindSession:
+			return 2
+		case LimitKindTransient:
+			return 1
+		default:
+			return 0
+		}
+	}
+	if priority(candidate.Kind) > priority(current.Kind) {
+		candidate.Message = ""
+		return candidate
+	}
+	return current
+}
+
+func formatCodexNoJSONWaitError(runResult streamingCLIResult) error {
+	return fmt.Errorf(
+		"codex failed: %w (parse error: %w)%s",
+		runResult.WaitErr,
+		errNoCodexJSON,
+		codexNoJSONDiagnostics(runResult),
+	)
+}
+
+func formatCodexNoJSONError(runResult streamingCLIResult) error {
+	return fmt.Errorf(
+		"codex CLI did not emit valid --json events; upgrade codex or check CLI compatibility: %w%s",
+		errNoCodexJSON,
+		codexNoJSONDiagnostics(runResult),
+	)
+}
+
+func codexNoJSONDiagnostics(runResult streamingCLIResult) string {
+	var detail strings.Builder
+	if stderr := truncateCLIWaitErrorOutput(runResult.Stderr); stderr != "" {
+		fmt.Fprintf(&detail, "\nstderr: %s", stderr)
+	}
+	if stdout := truncateCLIWaitErrorOutput(runResult.Stdout); stdout != "" {
+		fmt.Fprintf(&detail, "\nstdout: %s", stdout)
+	}
+	return detail.String()
 }
 
 // codexEvent represents a top-level event in codex's --json JSONL output.

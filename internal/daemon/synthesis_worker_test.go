@@ -24,6 +24,16 @@ import (
 	"go.kenn.io/roborev/internal/tokens"
 )
 
+type observingBroadcaster struct {
+	Broadcaster
+	observe func(Event)
+}
+
+func (b *observingBroadcaster) Broadcast(event Event) {
+	b.observe(event)
+	b.Broadcaster.Broadcast(event)
+}
+
 // markMemberRunning transitions a queued member job to running so that the
 // status-guarded CompleteJob/FailJob transitions take effect by ID.
 func markMemberRunning(t *testing.T, tc *workerTestContext, jobID int64) {
@@ -107,6 +117,15 @@ func TestAllMembersPassedIgnoresAllowedFailure(t *testing.T) {
 	assert.True(t, allMembersPassed(results, succeeded))
 }
 
+func TestFilterSucceededRejectsEmptyOutputPlaceholder(t *testing.T) {
+	results := []reviewpkg.ReviewResult{
+		{Status: reviewpkg.ResultDone, Output: "No review output generated"},
+		{Status: reviewpkg.ResultDone, Output: "Finding A"},
+	}
+
+	assert.Equal(t, results[1:], filterSucceeded(results))
+}
+
 // jobAgentInvoked reads the raw agent_invoked cost-eligibility marker for a job.
 func jobAgentInvoked(t *testing.T, tc *workerTestContext, jobID int64) bool {
 	t.Helper()
@@ -144,7 +163,7 @@ func TestRunSynthesisAgentMarksInvokedOnlyWhenAgentRuns(t *testing.T) {
 		job, err := tc.DB.GetJobByID(synth.ID)
 		require.NoError(t, err)
 
-		_, _, runErr := tc.Pool.runSynthesisAgent(context.Background(), testWorkerID, job, "prompt")
+		_, _, _, runErr := tc.Pool.runSynthesisAgent(context.Background(), testWorkerID, job, "prompt")
 		require.Error(t, runErr, "checkout must fail before the agent runs")
 
 		failed, err := tc.DB.GetJobByID(synth.ID)
@@ -170,7 +189,7 @@ func TestRunSynthesisAgentMarksInvokedOnlyWhenAgentRuns(t *testing.T) {
 		job, err := tc.DB.GetJobByID(synth.ID)
 		require.NoError(t, err)
 
-		_, _, runErr := tc.Pool.runSynthesisAgent(context.Background(), testWorkerID, job, "prompt")
+		_, _, _, runErr := tc.Pool.runSynthesisAgent(context.Background(), testWorkerID, job, "prompt")
 		require.NoError(t, runErr)
 		assert.True(t, jobAgentInvoked(t, tc, synth.ID),
 			"a synthesis agent that actually runs must be marked agent_invoked")
@@ -506,8 +525,11 @@ func TestSynthesisAllFailed(t *testing.T) {
 	}
 
 	synth := releaseAndClaimSynthesis(t, tc, runUUID)
-	tc.Pool.processSynthesisJob(context.Background(), testWorkerID, synth)
+	_, output, cancelOutput := tc.Pool.SubscribeJobOutput(synth.ID)
+	defer cancelOutput()
+	tc.Pool.processJob(testWorkerID, synth)
 
+	requireOutputChannelClosed(t, output)
 	tc.assertJobStatus(t, synth.ID, storage.JobStatusDone)
 	review, err := tc.DB.GetReviewByJobID(synth.ID)
 	require.NoError(t, err)
@@ -774,6 +796,18 @@ func TestSynthesisCapturesTokenUsage(t *testing.T) {
 		fetchedSession = sessionID
 		return &tokens.Usage{CostUSD: 0.03, HasCost: true}, nil
 	}
+	var usageAtCompletion string
+	tc.Pool.broadcaster = &observingBroadcaster{
+		Broadcaster: tc.Broadcaster,
+		observe: func(event Event) {
+			if event.Type != "review.completed" {
+				return
+			}
+			completed, err := tc.DB.GetJobByID(event.JobID)
+			require.NoError(t, err)
+			usageAtCompletion = completed.TokenUsage
+		},
+	}
 
 	runUUID, members, synth := enqueuePanelRun(t, tc, "synthesis-token-panel", []memberSpec{
 		{name: "m0", agent: memberAgent},
@@ -790,6 +824,44 @@ func TestSynthesisCapturesTokenUsage(t *testing.T) {
 	assert.Equal("synth-session-123", fetchedSession)
 	assert.Contains(updated.TokenUsage, `"cost_usd":0.03`)
 	assert.Contains(updated.TokenUsage, `"has_cost":true`)
+	assert.Contains(usageAtCompletion, `"cost_usd":0.03`)
+}
+
+func TestSynthesisRejectsProviderCostForReusedSession(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+
+	const memberAgent = "panel-synthesis-reused-token-member"
+	registerPassingAgent(t, memberAgent)
+
+	synthAgent := &synthesisEntrypointTestAgent{
+		name:       "panel-synthesis-reused-token",
+		streamLine: `{"type":"thread.started","thread_id":"shared-synth-session"}`,
+	}
+	agent.Register(synthAgent)
+	t.Cleanup(func() { agent.Unregister(synthAgent.name) })
+
+	tc.Pool.tokenUsageFetcher = func(context.Context, string) (*tokens.Usage, error) {
+		return &tokens.Usage{CostUSD: 0.03, HasCost: true}, nil
+	}
+
+	runUUID, members, synth := enqueuePanelRun(t, tc, "synthesis-reused-token-panel", []memberSpec{
+		{name: "m0", agent: memberAgent},
+		{name: "m1", agent: memberAgent},
+	})
+	setSynthesisAgent(t, tc, runUUID, synthAgent.name)
+	completeMember(t, tc, members[0].ID, memberAgent, "Medium issue in a.go")
+	completeMember(t, tc, members[1].ID, memberAgent, "Medium issue in b.go")
+
+	reused := tc.createAndClaimJobWithAgent(t, "other-synthesis-ref", "worker-reuse", "codex")
+	require.NoError(t, tc.DB.SaveJobSessionID(
+		reused.ID, "worker-reuse", "shared-synth-session",
+	))
+	synthesis := releaseAndClaimSynthesis(t, tc, runUUID)
+	tc.Pool.processSynthesisJob(context.Background(), testWorkerID, synthesis)
+
+	updated := tc.assertJobStatus(t, synth.ID, storage.JobStatusDone)
+	usage := tokens.ParseJSON(updated.TokenUsage)
+	assert.False(t, usage != nil && usage.HasCost)
 }
 
 func TestSynthesisAutoClosesPassingReview(t *testing.T) {

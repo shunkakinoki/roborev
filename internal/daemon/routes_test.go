@@ -115,30 +115,41 @@ func TestHumaListJobs(t *testing.T) {
 	})
 }
 
-func TestHumaListJobsCursorPagination(t *testing.T) {
+func TestHumaListJobsCursorPaginationRemainsStableAcrossRerun(t *testing.T) {
 	srv, db, _ := newTestServer(t)
 	repo := testutil.CreateTestRepo(t, db)
 	jobs := testutil.CreateTestJobs(t, db, repo, 5, "test-agent")
+	base := time.Now().Add(-5 * time.Hour).UTC().Truncate(time.Second)
+	for index, job := range jobs {
+		_, err := db.Exec(
+			"UPDATE review_jobs SET status = 'done', enqueued_at = ? WHERE id = ?",
+			base.Add(time.Duration(index)*time.Hour).Format(time.RFC3339), job.ID,
+		)
+		require.NoError(t, err)
+	}
 
-	// First page: 3 jobs (newest first by descending ID).
+	// First page: 3 jobs, newest enqueue position first.
 	rr := serveHuma(
 		t, srv, http.MethodGet, "/api/jobs?limit=3", nil,
 	)
 	require.Equal(t, http.StatusOK, rr.Code)
 
 	var page1 struct {
-		Jobs    []storage.ReviewJob `json:"jobs"`
-		HasMore bool                `json:"has_more"`
+		Jobs       []storage.ReviewJob `json:"jobs"`
+		HasMore    bool                `json:"has_more"`
+		NextCursor *string             `json:"next_cursor"`
 	}
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &page1))
 	require.Len(t, page1.Jobs, 3)
 	assert.True(t, page1.HasMore)
+	require.NotNil(t, page1.NextCursor)
 
-	// Cursor = smallest ID in page 1.
-	cursor := page1.Jobs[len(page1.Jobs)-1].ID
+	// Moving the boundary row to the front must not move the cursor boundary.
+	boundaryID := page1.Jobs[len(page1.Jobs)-1].ID
+	require.NoError(t, db.ReenqueueJob(boundaryID, storage.ReenqueueOpts{}))
 
 	rr2 := serveHuma(t, srv, http.MethodGet,
-		fmt.Sprintf("/api/jobs?limit=10&before=%d", cursor), nil,
+		fmt.Sprintf("/api/jobs?limit=10&cursor=%s", url.QueryEscape(*page1.NextCursor)), nil,
 	)
 	require.Equal(t, http.StatusOK, rr2.Code)
 
@@ -148,10 +159,9 @@ func TestHumaListJobsCursorPagination(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(rr2.Body.Bytes(), &page2))
 	assert.False(t, page2.HasMore)
-	for _, j := range page2.Jobs {
-		assert.Less(t, j.ID, cursor,
-			"all page2 jobs should have ID < cursor")
-	}
+	require.Len(t, page2.Jobs, 2)
+	assert.Equal(t, jobs[1].ID, page2.Jobs[0].ID)
+	assert.Equal(t, jobs[0].ID, page2.Jobs[1].ID)
 
 	// Both pages together should cover all jobs.
 	allIDs := make(map[int64]bool)
@@ -183,6 +193,52 @@ func TestHumaGetStatus(t *testing.T) {
 	assert.Equal(t, "tcp", status.Network)
 	assert.Equal(t, "127.0.0.1:7373", status.Address)
 	assert.Equal(t, 7373, status.Port)
+	assert.Contains(t, status.WebCapabilities, "review-projection-v1")
+	assert.Contains(t, status.WebCapabilities, "analytics-v1")
+}
+
+func TestHumaGetStatusIncludesActiveSnoozes(t *testing.T) {
+	srv, db, _ := newTestServer(t)
+	repo := testutil.CreateTestRepo(t, db)
+	until := time.Now().Add(time.Hour).UTC()
+	_, err := db.SetAgentHookSnooze(
+		repo.RootPath, repo.RootPath, "main", until,
+	)
+	require.NoError(t, err)
+
+	rr := serveHuma(t, srv, http.MethodGet, "/api/status", nil)
+	require.Equal(t, http.StatusOK, rr.Code)
+	var body struct {
+		ActiveSnoozes []storage.AgentHookSnooze `json:"active_snoozes"`
+	}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
+	require.Len(t, body.ActiveSnoozes, 1)
+	assert.Equal(t, repo.Name, body.ActiveSnoozes[0].RepoName)
+	assert.Equal(t, repo.RootPath, body.ActiveSnoozes[0].RepoPath)
+	assert.Equal(t, repo.RootPath, body.ActiveSnoozes[0].WorktreePath)
+	assert.Equal(t, "main", body.ActiveSnoozes[0].Branch)
+	assert.Equal(t, until, body.ActiveSnoozes[0].SnoozedUntil)
+}
+
+func TestHumaGetStatusUsesEmptyActiveSnoozeArray(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	rr := serveHuma(t, srv, http.MethodGet, "/api/status", nil)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	var body struct {
+		ActiveSnoozes json.RawMessage `json:"active_snoozes"`
+	}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
+	assert.JSONEq(t, `[]`, string(body.ActiveSnoozes))
+}
+
+func TestHumaGetStatusFailsWhenActiveSnoozesCannotBeRead(t *testing.T) {
+	srv, db, _ := newTestServer(t)
+	_, err := db.Exec(`DROP TABLE agent_hook_snoozes`)
+	require.NoError(t, err)
+
+	rr := serveHuma(t, srv, http.MethodGet, "/api/status", nil)
+	assert.Equal(t, http.StatusInternalServerError, rr.Code)
 }
 
 func TestHumaGetReview_NotFound(t *testing.T) {
@@ -761,6 +817,55 @@ func TestHumaBackfillTokensSkipsReusedSession(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, firstUpdated.TokenUsage)
 	assert.Empty(t, secondUpdated.TokenUsage)
+}
+
+func TestHumaBackfillTokensSkipsJobWithoutAgentRunEvidence(t *testing.T) {
+	srv, db, _ := newTestServer(t)
+	repo := testutil.CreateTestRepo(t, db)
+	job := testutil.CreateCompletedReview(
+		t, db, repo.ID, "pre-agent-failure", "test-agent", "review text",
+	)
+	_, err := db.Exec(
+		`UPDATE review_jobs SET session_id = ?, token_usage = NULL, agent_invoked = 0 WHERE id = ?`,
+		"uninvoked-session", job.ID,
+	)
+	require.NoError(t, err)
+
+	body, err := json.Marshal(map[string]any{
+		"sessions": []map[string]any{
+			{
+				"session_id":     "uninvoked-session",
+				"has_token_data": false,
+				"has_cost":       true,
+				"cost_usd":       0.42,
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	rr := serveHuma(
+		t, srv, http.MethodPost, "/api/tokens/backfill", body,
+	)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+	var resp struct {
+		Updated int `json:"updated"`
+		Skipped int `json:"skipped"`
+		Results []struct {
+			Status string `json:"status"`
+			Reason string `json:"reason"`
+		} `json:"results"`
+	}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
+	assert.Zero(t, resp.Updated)
+	assert.Equal(t, 1, resp.Skipped)
+	require.Len(t, resp.Results, 1)
+	assert.Equal(t, "skipped", resp.Results[0].Status)
+	assert.Equal(t, "no eligible job", resp.Results[0].Reason)
+
+	updated, err := db.GetJobByID(job.ID)
+	require.NoError(t, err)
+	assert.Empty(t, updated.TokenUsage)
 }
 
 func TestHumaOpenAPISpec(t *testing.T) {

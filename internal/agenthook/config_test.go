@@ -7,6 +7,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	kitagenthook "go.kenn.io/kit/agenthook"
+
+	"go.kenn.io/roborev/internal/config"
 )
 
 func TestResolveOptionsUsesDefaultsWithoutConfig(t *testing.T) {
@@ -18,6 +21,42 @@ func TestResolveOptionsUsesDefaultsWithoutConfig(t *testing.T) {
 	assert.Equal(t, DefaultCommitThreshold, opts.CommitThreshold)
 	assert.Equal(t, DefaultFailedReviewThreshold, opts.FailedReviewThreshold)
 	assert.Equal(t, DefaultInstruction, opts.Instruction)
+	assert.Empty(t, opts.FixGuidelines)
+}
+
+// If hook profile config redirects policy lookup, the active hook and a later
+// roborev fix process can apply different user policy.
+func TestResolveOptionsForAgentUsesStandardGlobalFixGuidelines(t *testing.T) {
+	clearAgentHookEnv(t)
+	require.NoError(t, os.WriteFile(config.GlobalConfigPath(), []byte(`fix_guidelines = "Global policy"`), 0o600))
+	alternate := writeAgentHookConfig(t, `
+[agent_hook]
+instruction = "Alternate agent flow"
+
+[droid_hook]
+instruction = "Alternate droid flow"
+`)
+
+	agentOpts, err := ResolveOptionsForAgent("claude", Options{ConfigPath: alternate}, map[string]bool{"config": true})
+	require.NoError(t, err)
+	assert.Equal(t, "Alternate agent flow", agentOpts.Instruction)
+	assert.Equal(t, "Global policy", agentOpts.FixGuidelines)
+
+	droidOpts, err := ResolveOptionsForAgent("droid", Options{ConfigPath: alternate}, map[string]bool{"config": true})
+	require.NoError(t, err)
+	assert.Equal(t, "Alternate droid flow", droidOpts.Instruction)
+	assert.Equal(t, "Global policy", droidOpts.FixGuidelines)
+}
+
+// If malformed global policy is ignored, the hook silently runs with its old
+// unconditional behavior instead of reporting the configuration error.
+func TestResolveOptionsForAgentRejectsMalformedStandardGlobal(t *testing.T) {
+	clearAgentHookEnv(t)
+	require.NoError(t, os.WriteFile(config.GlobalConfigPath(), []byte(`fix_guidelines = [`), 0o600))
+	alternate := writeAgentHookConfig(t, "[agent_hook]\ninstruction = \"Alternate flow\"\n")
+
+	_, err := ResolveOptionsForAgent("claude", Options{ConfigPath: alternate}, map[string]bool{"config": true})
+	require.ErrorContains(t, err, config.GlobalConfigPath())
 }
 
 func TestResolveOptionsUsesGlobalAgentHookConfig(t *testing.T) {
@@ -87,6 +126,17 @@ instruction = "config instruction"
 	assert.Equal(t, "127.0.0.1:9999", opts.RoborevServerAddr)
 }
 
+func TestResolveOptionsForEveryKitAgent(t *testing.T) {
+	clearAgentHookEnv(t)
+	for _, profile := range kitagenthook.Profiles() {
+		t.Run(string(profile.Agent), func(t *testing.T) {
+			opts, err := ResolveOptionsForAgent(string(profile.Agent), DefaultOptions(), nil)
+			require.NoError(t, err)
+			assert.Equal(t, DefaultInstruction, opts.Instruction)
+		})
+	}
+}
+
 func TestResolveOptionsAllowsZeroTurnThresholdFromConfig(t *testing.T) {
 	clearAgentHookEnv(t)
 	path := writeAgentHookConfig(t, `
@@ -101,6 +151,7 @@ turn_threshold = 0
 }
 
 func TestResolveOptionsEnvOverridesGlobalConfig(t *testing.T) {
+	clearAgentHookEnv(t)
 	path := writeAgentHookConfig(t, `
 [agent_hook]
 turn_threshold = 6
@@ -125,6 +176,7 @@ instruction = "config instruction"
 }
 
 func TestResolveOptionsFlagsOverrideEnv(t *testing.T) {
+	clearAgentHookEnv(t)
 	path := writeAgentHookConfig(t, `
 [agent_hook]
 turn_threshold = 6
@@ -203,13 +255,13 @@ func writeAgentHookConfig(t *testing.T, body string) string {
 
 func clearAgentHookEnv(t *testing.T) {
 	t.Helper()
+	t.Setenv("ROBOREV_DATA_DIR", t.TempDir())
 	for _, name := range []string{
 		TurnThresholdEnv,
 		CommitThresholdEnv,
 		FailedReviewThresholdEnv,
 		InstructionEnv,
 		RoborevServerEnv,
-		DaemonAddrEnv,
 		DroidTurnThresholdEnv,
 		DroidCommitThresholdEnv,
 		DroidFailedReviewThresholdEnv,
@@ -220,14 +272,12 @@ func clearAgentHookEnv(t *testing.T) {
 	}
 }
 
-func TestResolveOptionsForAgentGrokUsesSlashInstruction(t *testing.T) {
-	assert := assert.New(t)
-	// Empty config file so defaults apply without a user-set instruction.
+func TestResolveOptionsForAgentGrokUsesSelfContainedInstruction(t *testing.T) {
+	clearAgentHookEnv(t)
 	path := filepath.Join(t.TempDir(), "config.toml")
 	require.NoError(t, os.WriteFile(path, []byte(""), 0o600))
 	opts, err := ResolveOptionsForAgent("grok", Options{ConfigPath: path}, map[string]bool{"config": true})
+
 	require.NoError(t, err)
-	assert.Equal(DefaultGrokInstruction, opts.Instruction)
-	assert.Contains(opts.Instruction, "/roborev-fix")
-	assert.NotContains(opts.Instruction, "$roborev-fix")
+	assert.Equal(t, DefaultInstruction, opts.Instruction)
 }

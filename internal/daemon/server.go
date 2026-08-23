@@ -23,6 +23,7 @@ import (
 	gitrepo "go.kenn.io/kit/git/repo"
 
 	"go.kenn.io/roborev/internal/agent"
+	"go.kenn.io/roborev/internal/agenthook"
 	"go.kenn.io/roborev/internal/backfill"
 	"go.kenn.io/roborev/internal/config"
 	"go.kenn.io/roborev/internal/git"
@@ -35,29 +36,43 @@ import (
 
 // Server is the HTTP API server for the daemon
 type Server struct {
-	db              *storage.DB
-	configWatcher   *ConfigWatcher
-	broadcaster     Broadcaster
-	workerPool      *WorkerPool
-	httpServer      *http.Server
-	syncWorker      *storage.SyncWorker
-	ciPoller        *CIPoller
-	hookRunner      *HookRunner
-	errorLog        *ErrorLog
-	activityLog     *ActivityLog
-	telemetry       telemetry.Client
-	telemetryOnce   sync.Once
-	telemetryStop   chan struct{}
-	startTime       time.Time
-	endpointMu      sync.Mutex // protects endpoint (written by Start, read by Stop)
-	endpoint        DaemonEndpoint
-	socketActivated bool // true if started via systemd socket activation
-	stopOnce        sync.Once
-	stopErr         error
-	sweepMu         sync.Mutex         // protects sweepCancel (written by Start, read by Stop)
-	sweepCancel     context.CancelFunc // cancels the panel sweep goroutine on Stop
-	shutdownCh      chan struct{}      // closed when /api/shutdown is requested
-	shutdownOnce    sync.Once
+	db                      *storage.DB
+	configWatcher           *ConfigWatcher
+	broadcaster             Broadcaster
+	workerPool              *WorkerPool
+	httpServer              *http.Server
+	browserMu               sync.Mutex
+	browserServer           *http.Server
+	browserListener         net.Listener
+	browserRuntime          *BrowserRuntimeInfo
+	browserStopping         bool
+	allowWebCompilationStub bool
+	webDevOrigin            string
+	syncWorker              *storage.SyncWorker
+	ciPoller                *CIPoller
+	hookRunner              *HookRunner
+	errorLog                *ErrorLog
+	activityLog             *ActivityLog
+	telemetry               telemetry.Client
+	telemetryOnce           sync.Once
+	telemetryStop           chan struct{}
+	startTime               time.Time
+	endpointMu              sync.Mutex // protects endpoint (written by Start, read by Stop)
+	endpoint                DaemonEndpoint
+	alternateEndpoint       *DaemonEndpoint
+	socketActivated         bool // true if started via systemd socket activation
+	stopOnce                sync.Once
+	stopErr                 error
+	sweepMu                 sync.Mutex         // protects sweepCancel (written by Start, read by Stop)
+	sweepCancel             context.CancelFunc // cancels the panel sweep goroutine on Stop
+	shutdownCh              chan struct{}      // closed when /api/shutdown is requested
+	shutdownOnce            sync.Once
+	shutdownDrainMu         sync.Mutex
+	shutdownDraining        bool
+	updateDrain             *updateDrainLease
+	updateCoordinator       *updateDrainCoordinator
+	agentHookState          *agenthook.StateStore
+	agentHookStateErr       error
 
 	// Cached machine ID to avoid INSERT on every status request
 	machineIDMu sync.Mutex
@@ -66,8 +81,35 @@ type Server struct {
 
 const dailyTelemetryInterval = 24 * time.Hour
 
-// NewServer creates a new daemon server
-func NewServer(db *storage.DB, cfg *config.Config, configPath string) *Server {
+var (
+	shutdownCleanupTimeout       = 35 * time.Second
+	shutdownCleanupRetryInterval = 200 * time.Millisecond
+)
+
+var (
+	getSystemdListenerForServer      = getSystemdListener
+	listenAuxiliaryEndpointForServer = listenAuxiliaryEndpoint
+)
+
+// ServerOption customizes a daemon server before it starts.
+type ServerOption func(*Server)
+
+// WithWebDevelopmentOrigin adds one exact loopback origin for the disposable
+// development server. Production callers must not set this option.
+func WithWebDevelopmentOrigin(origin string) ServerOption {
+	return func(server *Server) {
+		server.webDevOrigin = origin
+	}
+}
+
+func withWebCompilationStub() ServerOption {
+	return func(server *Server) {
+		server.allowWebCompilationStub = true
+	}
+}
+
+// NewServer creates a new daemon server.
+func NewServer(db *storage.DB, cfg *config.Config, configPath string, options ...ServerOption) *Server {
 	// Initialize error log
 	errorLog, err := NewErrorLog(DefaultErrorLogPath())
 	if err != nil {
@@ -80,7 +122,11 @@ func NewServer(db *storage.DB, cfg *config.Config, configPath string) *Server {
 		log.Printf("Warning: failed to create activity log: %v", err)
 	}
 
-	return newServerWithLogs(db, cfg, configPath, errorLog, activityLog)
+	server := newServerWithLogs(db, cfg, configPath, errorLog, activityLog)
+	for _, option := range options {
+		option(server)
+	}
+	return server
 }
 
 func newServerWithLogs(
@@ -114,9 +160,14 @@ func newServerWithLogs(
 		startTime:     time.Now(),
 		shutdownCh:    make(chan struct{}),
 	}
+	s.updateCoordinator = &updateDrainCoordinator{server: s, now: time.Now}
+	s.agentHookState, s.agentHookStateErr = agenthook.LoadState(
+		daemonAgentHookSource{db: db},
+	)
 
 	mux := http.NewServeMux()
 	s.registerHumaAPI(mux)
+	s.registerAgentHookRoutes(mux)
 
 	s.httpServer = &http.Server{
 		Addr:    cfg.ServerAddr,
@@ -153,7 +204,7 @@ func (s *Server) Start(ctx context.Context) error {
 	cfg := s.configWatcher.Config()
 
 	// Check for socket activation before falling back to the config
-	listener, ep, err := getSystemdListener()
+	listener, ep, err := getSystemdListenerForServer()
 	if err != nil {
 		return err
 	}
@@ -178,13 +229,41 @@ func (s *Server) Start(ctx context.Context) error {
 			)
 		}
 	}
+	runtimes, err := ListAllRuntimes()
+	if err != nil {
+		if listener != nil {
+			_ = listener.Close()
+		}
+		return fmt.Errorf("check existing daemon runtimes: %w", err)
+	}
 
-	// Check if a responsive daemon is still running after cleanup
-	if info, err := GetAnyRunningDaemon(); err == nil && IsDaemonAlive(info.Endpoint()) {
+	// Check if a responsive daemon is still running after cleanup.
+	info, discoveryErr := GetAnyRunningDaemon()
+	if IsDaemonAccessDenied(discoveryErr) {
+		if listener != nil {
+			_ = listener.Close()
+		}
+		return discoveryErr
+	}
+	if discoveryErr == nil && IsDaemonAlive(info.Endpoint()) {
 		if listener != nil {
 			_ = listener.Close()
 		}
 		return fmt.Errorf("daemon already running (pid %d on %s)", info.PID, info.Address)
+	}
+	for _, runtime := range runtimes {
+		if runtime.PID > 0 && isProcessAlive(runtime.PID) {
+			if listener != nil {
+				_ = listener.Close()
+			}
+			return fmt.Errorf("daemon process still running (pid %d)", runtime.PID)
+		}
+	}
+	if err := s.db.SetShutdownDraining(false); err != nil {
+		if listener != nil {
+			_ = listener.Close()
+		}
+		return fmt.Errorf("clear interrupted shutdown drain: %w", err)
 	}
 
 	// Reset stale jobs from previous runs
@@ -202,30 +281,10 @@ func (s *Server) Start(ctx context.Context) error {
 		// Bind the listener before publishing runtime metadata so concurrent CLI
 		// invocations cannot race a half-started daemon and kill it as a zombie.
 		if ep.IsUnix() {
-			socketPath := ep.Address
-			socketDir := filepath.Dir(socketPath)
-			if err := os.MkdirAll(socketDir, 0o700); err != nil {
-				s.configWatcher.Stop()
-				return fmt.Errorf("create socket directory: %w", err)
-			}
-			// Verify the parent directory has safe permissions (owner-only)
-			if fi, err := os.Stat(socketDir); err == nil {
-				if perm := fi.Mode().Perm(); perm&0o077 != 0 {
-					s.configWatcher.Stop()
-					return fmt.Errorf("socket directory %s has unsafe permissions %o (must not be group/world accessible)", socketDir, perm)
-				}
-			}
-			// Remove stale socket from a previous run
-			os.Remove(socketPath)
-			listener, err = ep.Listener()
+			listener, err = listenUnixEndpoint(ep)
 			if err != nil {
 				s.configWatcher.Stop()
-				return fmt.Errorf("listen on %s: %w", ep, err)
-			}
-			if err := os.Chmod(socketPath, 0o600); err != nil {
-				_ = listener.Close()
-				s.configWatcher.Stop()
-				return fmt.Errorf("chmod socket: %w", err)
+				return err
 			}
 		} else {
 			// TCP: find an available port first
@@ -281,12 +340,69 @@ func (s *Server) Start(ctx context.Context) error {
 		return nil
 	}
 
+	var alternate *DaemonEndpoint
+	if !s.socketActivated {
+		auxListener, candidate, auxErr := listenAuxiliaryEndpointForServer(ep)
+		if auxErr != nil {
+			log.Printf("Warning: auxiliary Unix listener unavailable: %v", auxErr)
+		} else if auxListener != nil && candidate != nil {
+			auxServeErrCh := make(chan error, 1)
+			log.Printf("Starting auxiliary HTTP server on %s", candidate)
+			go func() {
+				auxServeErrCh <- s.httpServer.Serve(auxListener)
+			}()
+			auxReady, auxExited, readyErr := waitForServerReady(
+				ctx, *candidate, 2*time.Second, auxServeErrCh,
+			)
+			if readyErr != nil || !auxReady {
+				_ = auxListener.Close()
+				_ = os.Remove(candidate.Address)
+				if readyErr == nil {
+					readyErr = fmt.Errorf("listener exited before becoming ready")
+				}
+				log.Printf("Warning: auxiliary Unix listener unavailable: %v", readyErr)
+				if !auxExited {
+					_ = awaitServeExitOnUnreadyStartup(false, auxServeErrCh)
+				}
+			} else {
+				alternate = candidate
+				go func() {
+					serveErr := <-auxServeErrCh
+					if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+						log.Printf("Auxiliary Unix listener stopped: %v", serveErr)
+					}
+				}()
+			}
+		}
+	}
+
+	s.endpointMu.Lock()
+	s.alternateEndpoint = alternate
+	s.endpointMu.Unlock()
+
+	browserRuntime, err := s.startBrowserServer(cfg.Web)
+	if err != nil {
+		_ = s.httpServer.Close()
+		s.configWatcher.Stop()
+		s.workerPool.Stop()
+		return err
+	}
+	s.browserMu.Lock()
+	if s.browserStopping {
+		s.browserMu.Unlock()
+		_ = s.httpServer.Close()
+		s.configWatcher.Stop()
+		s.workerPool.Stop()
+		return fmt.Errorf("server stopped during browser startup")
+	}
+	s.browserRuntime = browserRuntime
 	s.startPanelSweep(ctx)
 
 	// Write runtime info only after the HTTP server is accepting requests.
-	if err := WriteRuntime(ep, version.Version); err != nil {
+	if err := WriteRuntime(ep, alternate, version.Version, browserRuntime); err != nil {
 		log.Printf("Warning: failed to write runtime info: %v", err)
 	}
+	s.browserMu.Unlock()
 
 	s.captureDaemonStartedTelemetry(cfg)
 	s.startDailyTelemetryLoop(ctx, cfg)
@@ -473,6 +589,9 @@ func getSystemdListener() (net.Listener, DaemonEndpoint, error) {
 // when the test body has already called Stop explicitly), and prevents
 // the "close of closed channel" panic when hookRunner.Stop runs twice.
 func (s *Server) Stop() error {
+	if err := s.beginShutdownDrain(); err != nil {
+		return err
+	}
 	s.stopOnce.Do(func() {
 		s.stopErr = s.stopOnce0()
 	})
@@ -489,35 +608,25 @@ func (s *Server) stopOnce0() error {
 			map[string]string{"uptime": formatDuration(uptime)},
 		)
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Remove runtime info
-	RemoveRuntime()
-
 	// Stop telemetry loop
 	close(s.telemetryStop)
 
 	// Stop config watcher
 	s.configWatcher.Stop()
 
-	// Stop HTTP server
-	if err := s.httpServer.Shutdown(ctx); err != nil {
-		log.Printf("HTTP server shutdown error: %v", err)
-	}
+	// Prevent a browser listener that is still starting from becoming available
+	// after shutdown has begun. The active listener remains available while
+	// workers drain, matching the CLI listener's graceful shutdown behavior.
+	s.browserMu.Lock()
+	s.browserStopping = true
+	browserServer := s.browserServer
+	browserListener := s.browserListener
+	s.browserMu.Unlock()
 
-	// Clean up Unix domain socket (if we created it)
-	s.endpointMu.Lock()
-	ep := s.endpoint
-	s.endpointMu.Unlock()
-	if ep.IsUnix() && !s.socketActivated {
-		os.Remove(ep.Address)
-	}
-
-	// Stop CI poller
+	// Stop new CI polling work. Keep its completion listener subscribed while
+	// active workers finish so their terminal events are still finalized.
 	if s.ciPoller != nil {
-		s.ciPoller.Stop()
+		s.ciPoller.BeginStop()
 	}
 
 	// Stop the panel sweep goroutine
@@ -526,9 +635,65 @@ func (s *Server) stopOnce0() error {
 	// Stop worker pool
 	s.workerPool.Stop()
 
+	// Workers cannot emit more completion events. Send the listener poison pill,
+	// drain its FIFO queue, and join any active CI post before teardown continues.
+	if s.ciPoller != nil {
+		s.ciPoller.Stop()
+	}
+
+	// Bound post-worker cleanup with one shared budget. Running reviews have
+	// already finished, so this deadline applies only to daemon teardown.
+	shutdownCleanupCtx, cancelShutdownCleanup := context.WithTimeout(
+		context.Background(), shutdownCleanupTimeout,
+	)
+	defer cancelShutdownCleanup()
+	var cleanupErr error
+
+	// Stop accepting mutations once workers have finished. Runtime discovery
+	// remains published until all completion work below is finalized.
+	if err := s.httpServer.Shutdown(shutdownCleanupCtx); err != nil {
+		log.Printf("HTTP server shutdown error: %v", err)
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("shutdown HTTP server: %w", err))
+	}
+	if browserServer != nil {
+		if err := browserServer.Shutdown(shutdownCleanupCtx); err != nil {
+			log.Printf("Browser HTTP server shutdown error: %v", err)
+			cleanupErr = errors.Join(
+				cleanupErr,
+				fmt.Errorf("shutdown browser HTTP server: %w", err),
+			)
+		}
+	} else if browserListener != nil {
+		if err := browserListener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			cleanupErr = errors.Join(
+				cleanupErr,
+				fmt.Errorf("close browser listener: %w", err),
+			)
+		}
+	}
+
 	// Stop hook runner
 	if s.hookRunner != nil {
+		s.hookRunner.WaitUntilIdle()
 		s.hookRunner.Stop()
+	}
+	if s.syncWorker != nil {
+		if err := s.syncWorker.FinalPush(); err != nil {
+			log.Printf("Final sync push error: %v", err)
+		}
+		s.syncWorker.Stop()
+	}
+
+	// Clean up Unix domain sockets after the server stops accepting requests.
+	s.endpointMu.Lock()
+	ep := s.endpoint
+	alternate := s.alternateEndpoint
+	s.endpointMu.Unlock()
+	if ep.IsUnix() && !s.socketActivated {
+		os.Remove(ep.Address)
+	}
+	if alternate != nil {
+		os.Remove(alternate.Address)
 	}
 
 	// Close error log
@@ -541,7 +706,37 @@ func (s *Server) stopOnce0() error {
 		s.activityLog.Close()
 	}
 
-	return nil
+	// Keep discovery metadata published until all daemon work and HTTP serving
+	// have stopped, so another daemon cannot start during finalization.
+	if err := s.clearShutdownDrain(shutdownCleanupCtx); err != nil {
+		cleanupErr = errors.Join(cleanupErr, err)
+	}
+	RemoveRuntime()
+
+	return cleanupErr
+}
+
+func (s *Server) clearShutdownDrain(ctx context.Context) error {
+	s.shutdownDrainMu.Lock()
+	draining := s.shutdownDraining
+	s.shutdownDrainMu.Unlock()
+	if !draining {
+		return nil
+	}
+	var lastErr error
+	for {
+		if err := s.db.SetShutdownDrainingContext(ctx, false); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			log.Printf("Clear shutdown drain state failed; retrying: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("clear shutdown drain state: %w", errors.Join(lastErr, ctx.Err()))
+		case <-time.After(shutdownCleanupRetryInterval):
+		}
+	}
 }
 
 // Close shuts down the server and releases its resources.
@@ -715,8 +910,7 @@ func resolveRerunModelProvider(job *storage.ReviewJob, cfg *config.Config) (stri
 func validateRerunAgent(repoPath string, agentName string, backupAgent string, cfg *config.Config) error {
 	_, err := agent.GetPreferredOrBackupWithConfig(repoPath, agentName, cfg, backupAgent)
 	if err != nil {
-		var unknownErr *agent.UnknownAgentError
-		if errors.As(err, &unknownErr) {
+		if _, ok := errors.AsType[*agent.UnknownAgentError](err); ok {
 			return fmt.Errorf("invalid agent: %w", err)
 		}
 		return fmt.Errorf("no agent available: %w", err)
@@ -980,8 +1174,20 @@ func (s *Server) humaListJobs(
 			)
 		}
 		job.Patch = nil
+		review, reviewErr := s.db.GetReviewByJobID(job.ID)
+		if reviewErr == nil {
+			job.Closed = &review.Closed
+			if review.Job != nil {
+				job.Verdict = review.Job.Verdict
+			}
+		} else if !errors.Is(reviewErr, sql.ErrNoRows) {
+			return nil, huma.Error500InternalServerError(
+				fmt.Sprintf("load job review metadata: %v", reviewErr),
+			)
+		}
 		resp := &ListJobsOutput{}
 		resp.Body.Jobs = []storage.ReviewJob{*job}
+		attachPanelSummaries(s.db, resp.Body.Jobs)
 		if input.OmitPrompt == "true" {
 			stripJobPrompts(resp.Body.Jobs)
 		}
@@ -1053,7 +1259,9 @@ func (s *Server) humaListJobs(
 			listOpts, storage.WithGitRef(input.GitRef),
 		)
 	}
-	if input.Branch != "" {
+	if input.BranchEmpty == "true" {
+		listOpts = append(listOpts, storage.WithEmptyBranch())
+	} else if input.Branch != "" {
 		if input.BranchIncludeEmpty == "true" {
 			listOpts = append(
 				listOpts,
@@ -1093,7 +1301,18 @@ func (s *Server) humaListJobs(
 			listOpts, storage.WithRepoPrefix(repoPrefix),
 		)
 	}
-	if input.Before > 0 {
+	if input.Cursor != "" && input.Before > 0 {
+		return nil, huma.Error400BadRequest("cursor and before are mutually exclusive")
+	}
+	position, enqueuedAt, cursorErr := s.decodeJobListCursor(input.Cursor)
+	if cursorErr != nil {
+		return nil, huma.Error400BadRequest(cursorErr.Error())
+	}
+	if position != nil {
+		listOpts = append(
+			listOpts, storage.WithBeforePosition(enqueuedAt, position.JobID),
+		)
+	} else if input.Before > 0 {
 		listOpts = append(
 			listOpts, storage.WithBeforeCursor(input.Before),
 		)
@@ -1127,6 +1346,16 @@ func (s *Server) humaListJobs(
 		hasMore = true
 		jobs = jobs[:limit]
 	}
+	var nextCursor *string
+	if hasMore && len(jobs) > 0 {
+		encoded, cursorErr := s.encodeJobListCursor(jobs[len(jobs)-1])
+		if cursorErr != nil {
+			return nil, huma.Error500InternalServerError(
+				fmt.Sprintf("encode jobs cursor: %v", cursorErr),
+			)
+		}
+		nextCursor = &encoded
+	}
 
 	if input.OmitPrompt == "true" {
 		stripJobPrompts(jobs)
@@ -1134,10 +1363,18 @@ func (s *Server) humaListJobs(
 
 	attachPanelSummaries(s.db, jobs)
 
-	// Stats use same repo/branch filters but ignore closed
-	// and pagination.
+	// Stats describe the aggregate population for the active scope and ignore
+	// pagination. The closed-state filter intentionally applies only to the
+	// listing: queue consumers use Stats to report both open and closed totals.
+	// FilteredStats below carries the exact closed-filtered counts for browser
+	// views that need counts matching the visible rows.
 	var statsOpts []storage.ListJobsOption
-	if input.Branch != "" {
+	if input.GitRef != "" {
+		statsOpts = append(statsOpts, storage.WithGitRef(input.GitRef))
+	}
+	if input.BranchEmpty == "true" {
+		statsOpts = append(statsOpts, storage.WithEmptyBranch())
+	} else if input.Branch != "" {
 		if input.BranchIncludeEmpty == "true" {
 			statsOpts = append(
 				statsOpts,
@@ -1179,17 +1416,37 @@ func (s *Server) humaListJobs(
 		statsOpts,
 		storage.WithExcludePanelRole(storage.PanelRoleMember),
 	)
-	stats, statsErr := s.db.CountJobStats(repo, statsOpts...)
+	stats, statsErr := s.db.CountJobStats(input.Status, repo, statsOpts...)
 	if statsErr != nil {
 		log.Printf(
 			"Warning: failed to count job stats: %v", statsErr,
 		)
 	}
+	var filteredStats *storage.JobStats
+	if input.Closed == "true" || input.Closed == "false" {
+		filteredOpts := append(
+			append([]storage.ListJobsOption(nil), statsOpts...),
+			storage.WithClosed(input.Closed == "true"),
+		)
+		filtered, filteredErr := s.db.CountJobStats(
+			input.Status, repo, filteredOpts...,
+		)
+		if filteredErr != nil {
+			log.Printf(
+				"Warning: failed to count closed-filtered job stats: %v",
+				filteredErr,
+			)
+		} else {
+			filteredStats = &filtered
+		}
+	}
 
 	resp := &ListJobsOutput{}
 	resp.Body.Jobs = jobs
 	resp.Body.HasMore = hasMore
+	resp.Body.NextCursor = nextCursor
 	resp.Body.Stats = &stats
+	resp.Body.FilteredStats = filteredStats
 	return resp, nil
 }
 
@@ -1361,6 +1618,67 @@ func (s *Server) humaExportCIMetrics(
 	return resp, nil
 }
 
+func (s *Server) humaExportCICosts(
+	ctx context.Context, input *ExportCICostInput,
+) (*ExportCICostOutput, error) {
+	if input.Format != "" && input.Format != "json" {
+		return nil, huma.Error400BadRequest("unsupported export format")
+	}
+	if input.Cursor != "" && (input.Since != "" || input.Until != "") {
+		return nil, huma.Error400BadRequest("cursor cannot be used with since or until")
+	}
+	since, sinceOut, err := parseExportTimeBound(input.Since, false)
+	if err != nil {
+		return nil, huma.Error400BadRequest("invalid since")
+	}
+	until, untilOut, err := parseExportTimeBound(input.Until, true)
+	if err != nil {
+		return nil, huma.Error400BadRequest("invalid until")
+	}
+
+	page, err := s.db.ExportCICosts(storage.ExportCICostOptions{
+		Since: since, Until: until, Cursor: input.Cursor,
+		Limit: input.Limit, Legacy: input.Legacy,
+	})
+	if err != nil {
+		if errors.Is(err, storage.ErrExportCursorDatabaseMismatch) {
+			return nil, huma.Error409Conflict(err.Error())
+		}
+		return nil, huma.Error400BadRequest(err.Error())
+	}
+	if sinceOut == nil && !page.EffectiveSince.IsZero() {
+		value := page.EffectiveSince.UTC().Format(time.RFC3339)
+		sinceOut = &value
+	}
+	if untilOut == nil && !page.EffectiveUntil.IsZero() {
+		value := page.EffectiveUntil.UTC().Format(time.RFC3339)
+		untilOut = &value
+	}
+	databaseID, err := s.db.GetDatabaseID()
+	if err != nil {
+		return nil, fmt.Errorf("get database ID: %w", err)
+	}
+
+	resp := &ExportCICostOutput{}
+	resp.Body = ExportCICostDocument{
+		SchemaVersion: 1,
+		Tool:          "roborev",
+		ToolVersion:   version.Version,
+		GeneratedAt:   time.Now().UTC().Format(time.RFC3339),
+		DatabaseID:    databaseID,
+		Legacy:        input.Legacy,
+		Window: ExportReviewsWindow{
+			Field: "finished_at",
+			Since: sinceOut,
+			Until: untilOut,
+		},
+		Truncated:  page.Truncated,
+		NextCursor: page.NextCursor,
+		Jobs:       page.Jobs,
+	}
+	return resp, nil
+}
+
 func parseExportTimeBound(raw string, upper bool) (time.Time, *string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -1461,38 +1779,25 @@ func (s *Server) humaResolveRepo(
 		return nil, huma.Error400BadRequest("path is required")
 	}
 
-	lookupPath := path
-	if repoRoot, err := gitrepo.MainRoot(ctx, path); err == nil {
-		lookupPath = repoRoot
-	}
-
-	repo, err := s.db.GetRepoByPath(lookupPath)
-	if errors.Is(err, sql.ErrNoRows) {
-		return &ResolveRepoOutput{}, nil
-	}
+	resolved, err := resolveTrackedRepo(ctx, s.db, path, input.Branch)
 	if err != nil {
 		return nil, huma.Error500InternalServerError(
-			fmt.Sprintf("lookup repo: %v", err),
+			err.Error(),
 		)
+	}
+	if !resolved.Tracked {
+		return &ResolveRepoOutput{}, nil
 	}
 
 	resp := &ResolveRepoOutput{}
 	resp.Body.Tracked = true
 	resp.Body.Repo = &ResolvedRepo{
-		RootPath: repo.RootPath,
-		Identity: repo.Identity,
-		Name:     repo.Name,
+		RootPath: resolved.RootPath,
+		Identity: resolved.Identity,
+		Name:     resolved.Name,
 	}
-	snooze, err := s.db.ActiveAgentHookSnooze(
-		repo.RootPath, path, input.Branch, time.Now(),
-	)
-	if err != nil {
-		return nil, huma.Error500InternalServerError(
-			fmt.Sprintf("lookup agent hook snooze: %v", err),
-		)
-	}
-	if snooze != nil {
-		resp.Body.Repo.AgentHookSnoozedUntil = &snooze.SnoozedUntil
+	if !resolved.SnoozedUntil.IsZero() {
+		resp.Body.Repo.AgentHookSnoozedUntil = &resolved.SnoozedUntil
 	}
 	return resp, nil
 }
@@ -1583,6 +1888,12 @@ func (s *Server) humaGetStatus(
 			fmt.Sprintf("get counts: %v", err),
 		)
 	}
+	activeSnoozes, err := s.db.ListActiveAgentHookSnoozes(time.Now())
+	if err != nil {
+		return nil, huma.Error500InternalServerError(
+			fmt.Sprintf("list active agent hook snoozes: %v", err),
+		)
+	}
 
 	configReloadedAt := ""
 	if t := s.configWatcher.LastReloadedAt(); !t.IsZero() {
@@ -1603,6 +1914,7 @@ func (s *Server) humaGetStatus(
 
 	resp := &GetStatusOutput{}
 	resp.Body = storage.DaemonStatus{
+		ActiveSnoozes:       activeSnoozes,
 		Version:             version.Version,
 		QueuedJobs:          queued,
 		RunningJobs:         running,
@@ -1622,6 +1934,13 @@ func (s *Server) humaGetStatus(
 		MachineID:           s.getMachineID(),
 		ConfigReloadedAt:    configReloadedAt,
 		ConfigReloadCounter: configReloadCounter,
+		WebCapabilities:     []string{"review-projection-v1", "analytics-v1"},
+	}
+	updateDraining, updatePolicy, updateExpiresAt := s.updateDrainStatus()
+	resp.Body.UpdateDraining = updateDraining
+	resp.Body.UpdateDrainPolicy = updatePolicy
+	if !updateExpiresAt.IsZero() {
+		resp.Body.UpdateDrainExpiresAt = updateExpiresAt.Format(time.RFC3339)
 	}
 	return resp, nil
 }
@@ -1629,6 +1948,11 @@ func (s *Server) humaGetStatus(
 func (s *Server) humaPauseQueue(
 	ctx context.Context, input *QueuePauseInput,
 ) (*QueuePauseOutput, error) {
+	s.shutdownDrainMu.Lock()
+	defer s.shutdownDrainMu.Unlock()
+	if s.shutdownDraining {
+		return nil, huma.Error409Conflict("daemon shutdown in progress")
+	}
 	if err := s.db.SetQueuePaused(true); err != nil {
 		return nil, huma.Error500InternalServerError(
 			fmt.Sprintf("pause queue: %v", err),
@@ -1642,6 +1966,11 @@ func (s *Server) humaPauseQueue(
 func (s *Server) humaUnpauseQueue(
 	ctx context.Context, input *QueuePauseInput,
 ) (*QueuePauseOutput, error) {
+	s.shutdownDrainMu.Lock()
+	defer s.shutdownDrainMu.Unlock()
+	if s.shutdownDraining {
+		return nil, huma.Error409Conflict("daemon shutdown in progress")
+	}
 	if err := s.db.SetQueuePaused(false); err != nil {
 		return nil, huma.Error500InternalServerError(
 			fmt.Sprintf("unpause queue: %v", err),
@@ -1741,6 +2070,21 @@ func (s *Server) humaCancelJob(
 		log.Printf("cancel job %d: panel routing lookup failed: %v",
 			input.Body.JobID, jobErr)
 	}
+	if remoteBrowserPrincipal(ctx) && jobErr != nil {
+		if errors.Is(jobErr, sql.ErrNoRows) {
+			return nil, huma.Error404NotFound(
+				"job not found or not cancellable",
+			)
+		}
+		return nil, huma.Error500InternalServerError(
+			fmt.Sprintf("load job: %v", jobErr),
+		)
+	}
+	if jobErr == nil {
+		if err := s.authorizeBrowserJobCancellation(ctx, job); err != nil {
+			return nil, err
+		}
+	}
 	if err := s.db.CancelJob(input.Body.JobID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, huma.Error404NotFound(
@@ -1751,7 +2095,7 @@ func (s *Server) humaCancelJob(
 			fmt.Sprintf("cancel job: %v", err),
 		)
 	}
-	s.workerPool.CancelJob(input.Body.JobID)
+	s.workerPool.cancelJob(input.Body.JobID, true)
 
 	s.retireCIPanelForCanceledSynthesis(job)
 
@@ -1761,8 +2105,21 @@ func (s *Server) humaCancelJob(
 	// complete the synthesis despite the user's cancel. Canceling the parent
 	// first makes the later MaybeReleasePanelSynthesis a no-op on an
 	// already-terminal row.
-	s.cascadeCancelPanelMembers(job)
+	canceledMembers := s.cascadeCancelPanelMembers(job, true)
 	s.releaseSynthesisIfCanceledMember(job)
+
+	if job == nil {
+		job, _ = s.db.GetJobByID(input.Body.JobID)
+	}
+	s.broadcaster.Broadcast(eventForMutationPrincipal(
+		ctx, eventForJob("review.canceled", job, input.Body.JobID),
+	))
+	for i := range canceledMembers {
+		member := &canceledMembers[i]
+		s.broadcaster.Broadcast(eventForMutationPrincipal(
+			ctx, eventForJob("review.canceled", member, member.ID),
+		))
+	}
 
 	resp := &CancelJobOutput{}
 	resp.Body.Success = true
@@ -1777,7 +2134,6 @@ func (s *Server) humaRerunJob(
 			"job_id is required",
 		)
 	}
-
 	job, err := s.db.GetJobByID(input.Body.JobID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1789,13 +2145,37 @@ func (s *Server) humaRerunJob(
 			fmt.Sprintf("load job: %v", err),
 		)
 	}
+	if remoteBrowserPrincipal(ctx) {
+		return nil, huma.Error403Forbidden(
+			"remote browser sessions cannot rerun jobs",
+		)
+	}
+	if input.Body.RequestID != "" {
+		result, found, err := s.db.GetRerunRequest(input.Body.RequestID, input.Body.JobID)
+		if err != nil {
+			return nil, huma.Error500InternalServerError(
+				fmt.Sprintf("load rerun request: %v", err),
+			)
+		}
+		if found {
+			resp := &RerunJobOutput{}
+			resp.Body.Success = true
+			resp.Body.JobID = result.JobID
+			resp.Body.RequestID = input.Body.RequestID
+			resp.Body.RunUUID = result.PanelRunUUID
+			return resp, nil
+		}
+	}
+	if job.Status == storage.JobStatusCanceled && job.WorkerID != "" {
+		return nil, huma.Error409Conflict("canceled job is still stopping")
+	}
 
 	// Rerunning a panel synthesis parent spawns a brand-new panel run (fresh
 	// members + a re-blocked synthesis) rather than re-queueing the parent in
 	// place, so the new run gets fresh member reviews to synthesize.
 	// rerunPanelRun enforces the terminal-state guard.
 	if job.IsSynthesisJob() {
-		return s.rerunPanelRun(job)
+		return s.rerunPanelRun(job, input.Body.RequestID)
 	}
 	if job.PanelRole == storage.PanelRoleMember {
 		return nil, huma.Error400BadRequest(
@@ -1810,12 +2190,12 @@ func (s *Server) humaRerunJob(
 		return nil, huma.Error400BadRequest(err.Error())
 	}
 
-	err = s.db.ReenqueueJob(
+	resultJobID, replayed, err := s.db.ReenqueueJobWithRequest(
 		input.Body.JobID,
 		storage.ReenqueueOpts{
 			Model:    model,
 			Provider: provider,
-		},
+		}, input.Body.RequestID,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1827,10 +2207,30 @@ func (s *Server) humaRerunJob(
 			fmt.Sprintf("rerun job: %v", err),
 		)
 	}
+	if !replayed {
+		s.broadcastRerunEnqueued(resultJobID, job.UUID, job)
+	}
 
 	resp := &RerunJobOutput{}
 	resp.Body.Success = true
+	resp.Body.JobID = resultJobID
+	resp.Body.RequestID = input.Body.RequestID
 	return resp, nil
+}
+
+func (s *Server) broadcastRerunEnqueued(
+	jobID int64, jobUUID string, source *storage.ReviewJob,
+) {
+	s.broadcaster.Broadcast(Event{
+		Type:     "job.enqueued",
+		TS:       time.Now(),
+		JobID:    jobID,
+		JobUUID:  jobUUID,
+		Repo:     source.RepoPath,
+		RepoName: source.RepoName,
+		SHA:      source.GitRef,
+		Agent:    source.Agent,
+	})
 }
 
 func (s *Server) humaCloseReview(
@@ -1872,7 +2272,7 @@ func (s *Server) humaCloseReview(
 		evt.Branch = job.HookBranch()
 		evt.Agent = job.Agent
 	}
-	s.broadcaster.Broadcast(evt)
+	s.broadcaster.Broadcast(eventForMutationPrincipal(ctx, evt))
 
 	resp := &CloseReviewOutput{}
 	resp.Body.Success = true
@@ -1895,13 +2295,19 @@ func (s *Server) humaAddComment(
 	}
 
 	var resp *storage.Response
+	var commentEvent Event
 	var err error
+	source := storage.ResponseSourceLocal
+	if principal, found := BrowserPrincipalFromContext(ctx); found && !principal.Local {
+		source = storage.ResponseSourceRemoteBrowser
+	}
 
 	if input.Body.JobID != 0 {
-		resp, err = s.db.AddCommentToJob(
+		resp, err = s.db.AddCommentToJobWithSource(
 			input.Body.JobID,
 			input.Body.Commenter,
 			input.Body.Comment,
+			source,
 		)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -1913,6 +2319,11 @@ func (s *Server) humaAddComment(
 				fmt.Sprintf("add comment: %v", err),
 			)
 		}
+		job, jobErr := s.db.GetJobByID(input.Body.JobID)
+		if jobErr != nil {
+			log.Printf("comment on job %d: load event metadata: %v", input.Body.JobID, jobErr)
+		}
+		commentEvent = eventForJob("review.commented", job, input.Body.JobID)
 	} else {
 		commit, commitErr := s.db.GetCommitBySHA(input.Body.SHA)
 		if commitErr != nil {
@@ -1921,17 +2332,31 @@ func (s *Server) humaAddComment(
 			)
 		}
 
-		resp, err = s.db.AddComment(
+		resp, err = s.db.AddCommentWithSource(
 			commit.ID,
 			input.Body.Commenter,
 			input.Body.Comment,
+			source,
 		)
 		if err != nil {
 			return nil, huma.Error500InternalServerError(
 				fmt.Sprintf("add comment: %v", err),
 			)
 		}
+		commentEvent = Event{
+			Type: "review.commented",
+			TS:   time.Now(),
+			SHA:  commit.SHA,
+		}
+		repo, repoErr := s.db.GetRepoByID(commit.RepoID)
+		if repoErr != nil {
+			log.Printf("comment on commit %s: load event metadata: %v", commit.SHA, repoErr)
+		} else {
+			commentEvent.Repo = repo.RootPath
+			commentEvent.RepoName = repo.Name
+		}
 	}
+	s.broadcaster.Broadcast(eventForMutationPrincipal(ctx, commentEvent))
 
 	return &AddCommentOutput{Body: resp}, nil
 }
@@ -2223,8 +2648,7 @@ func (s *Server) resolveSingleAgent(
 		repoCfg, agentName, in.cfg, resolution.BackupAgent,
 	)
 	if err != nil {
-		var unknownErr *agent.UnknownAgentError
-		if errors.As(err, &unknownErr) {
+		if _, ok := errors.AsType[*agent.UnknownAgentError](err); ok {
 			out, _ := rawJSONOutput(
 				http.StatusBadRequest,
 				ErrorResponse{Error: fmt.Sprintf("invalid agent: %v", err)},
@@ -2684,8 +3108,7 @@ func (s *Server) humaFixJob(
 	if resolved, err := agent.GetPreferredOrBackupWithConfig(
 		resolutionPath, agentName, cfg, resolution.BackupAgent,
 	); err != nil {
-		var unknownErr *agent.UnknownAgentError
-		if errors.As(err, &unknownErr) {
+		if _, ok := errors.AsType[*agent.UnknownAgentError](err); ok {
 			return rawJSONOutput(
 				http.StatusBadRequest,
 				ErrorResponse{Error: fmt.Sprintf("invalid agent: %v", err)},
@@ -2911,10 +3334,37 @@ func (s *Server) humaPing(
 func (s *Server) humaShutdown(
 	ctx context.Context, input *struct{},
 ) (*ShutdownOutput, error) {
+	if err := s.beginShutdownDrain(); err != nil {
+		return nil, huma.Error500InternalServerError(
+			fmt.Sprintf("prepare graceful shutdown: %v", err),
+		)
+	}
 	s.RequestShutdown()
 	resp := &ShutdownOutput{}
 	resp.Body.Status = "shutting down"
 	return resp, nil
+}
+
+func (s *Server) beginShutdownDrain() error {
+	s.shutdownDrainMu.Lock()
+	defer s.shutdownDrainMu.Unlock()
+	if s.shutdownDraining {
+		return nil
+	}
+	if s.updateDrain == nil {
+		if err := s.db.SetShutdownDraining(true); err != nil {
+			return fmt.Errorf("block job claims for shutdown: %w", err)
+		}
+	}
+	s.shutdownDraining = true
+	if s.updateDrain != nil {
+		if s.updateDrain.timer != nil {
+			s.updateDrain.timer.Stop()
+		}
+		s.updateDrain = nil
+	}
+	s.workerPool.BeginStop()
+	return nil
 }
 
 // RequestShutdown signals that the daemon should shut down gracefully.
@@ -2991,6 +3441,18 @@ func (s *Server) humaJobOutput(
 
 		if input.Stream != "1" {
 			lines := s.workerPool.GetJobOutput(jobID)
+			if len(lines) == 0 && jobStatusHasPersistedOutput(job.Status) {
+				normalizerAgent := agent.CanonicalName(job.Agent)
+				if review, reviewErr := s.db.GetReviewByJobID(jobID); reviewErr == nil && review.Agent != "" {
+					normalizerAgent = agent.CanonicalName(review.Agent)
+				}
+				persisted, err := readNormalizedJobOutputForAttempt(
+					jobID, normalizerAgent, job.StartedAt,
+				)
+				if err == nil {
+					lines = persisted
+				}
+			}
 			if lines == nil {
 				lines = []OutputLine{}
 			}
@@ -3070,6 +3532,17 @@ func (s *Server) humaJobOutput(
 	}}, nil
 }
 
+func jobStatusHasPersistedOutput(status storage.JobStatus) bool {
+	switch status {
+	case storage.JobStatusDone, storage.JobStatusFailed,
+		storage.JobStatusCanceled, storage.JobStatusApplied,
+		storage.JobStatusRebased, storage.JobStatusSkipped:
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Server) humaJobLog(
 	ctx context.Context, input *JobLogInput,
 ) (*huma.StreamResponse, error) {
@@ -3100,6 +3573,20 @@ func (s *Server) humaJobLog(
 			)
 			return
 		}
+		identity, readErr := ResolveJobLogIdentity(job)
+		if readErr != nil {
+			log.Printf("humaJobLog: read agent metadata for job %d: %v", jobID, readErr)
+		}
+		logAgent := identity.Agent
+		resetOffset := false
+		if input.PreviousAgent != "" && input.PreviousAgent != logAgent {
+			if !identity.Recorded && job.Status == storage.JobStatusQueued {
+				logAgent = input.PreviousAgent
+			} else if identity.Source != storage.JobSourceAutoDesign || identity.Recorded {
+				offset = 0
+				resetOffset = true
+			}
+		}
 
 		f, err := os.Open(JobLogPath(jobID))
 		if err != nil {
@@ -3107,6 +3594,8 @@ func (s *Server) humaJobLog(
 				job.Status == storage.JobStatusRunning {
 				hctx.SetHeader("Content-Type", "application/x-ndjson")
 				hctx.SetHeader("X-Job-Status", string(job.Status))
+				hctx.SetHeader("X-Job-Agent", logAgent)
+				hctx.SetHeader("X-Job-Source", job.Source)
 				hctx.SetHeader("X-Log-Offset", "0")
 				return
 			}
@@ -3129,6 +3618,7 @@ func (s *Server) humaJobLog(
 		fileSize := fi.Size()
 		if offset > fileSize {
 			offset = 0
+			resetOffset = true
 		}
 
 		endPos := fileSize
@@ -3149,7 +3639,12 @@ func (s *Server) humaJobLog(
 
 		hctx.SetHeader("Content-Type", "application/x-ndjson")
 		hctx.SetHeader("X-Job-Status", string(job.Status))
+		hctx.SetHeader("X-Job-Agent", logAgent)
+		hctx.SetHeader("X-Job-Source", job.Source)
 		hctx.SetHeader("X-Log-Offset", strconv.FormatInt(endPos, 10))
+		if resetOffset {
+			hctx.SetHeader("X-Log-Reset", "true")
+		}
 
 		if n := endPos - offset; n > 0 {
 			if _, err := io.CopyN(hctx.BodyWriter(), f, n); err != nil {
@@ -3281,6 +3776,7 @@ func (s *Server) humaStreamEvents(
 
 		subID, eventCh := s.broadcaster.Subscribe(input.Repo)
 		defer s.broadcaster.Unsubscribe(subID)
+		flusher.Flush()
 
 		encoder := json.NewEncoder(writer)
 		for {

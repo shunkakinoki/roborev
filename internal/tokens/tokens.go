@@ -18,6 +18,11 @@ import (
 	"go.kenn.io/roborev/internal/procutil"
 )
 
+// ErrUsageProviderUnavailable marks a required usage provider that cannot be
+// invoked. Callers can distinguish it from a missing session without treating
+// the optional provider as a user-visible failure.
+var ErrUsageProviderUnavailable = errors.New("usage provider unavailable")
+
 // Usage holds token consumption data for a single review job.
 // Stored as JSON in the review_jobs.token_usage column.
 // Fields align with agentsview's session-usage output.
@@ -199,7 +204,10 @@ func fetchForSessionCLI(
 	binPath, err := resolveAgentsview()
 	if err != nil {
 		if cfg.RequireCLI {
-			return nil, fmt.Errorf("agentsview lookup: %w", err)
+			return nil, fmt.Errorf(
+				"%w: agentsview lookup: %w",
+				ErrUsageProviderUnavailable, err,
+			)
 		}
 		return nil, nil
 	}
@@ -277,8 +285,7 @@ func shouldFallbackToTokenUse(err error) bool {
 }
 
 func handleSessionUsageError(err error) error {
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
+	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
 		// agentsview usage exit codes: 2 = session not found,
 		// 3 = found but no token/cost data. Both mean "no usage",
 		// not an error.
@@ -296,8 +303,7 @@ func handleSessionUsageError(err error) error {
 }
 
 func handleTokenUseError(out []byte, err error) error {
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
+	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
 		// Legacy token-use signalled not-found with exit 1 and empty
 		// stdout+stderr.
 		if exitErr.ExitCode() == 1 &&

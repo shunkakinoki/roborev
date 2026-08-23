@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -13,9 +17,22 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"go.kenn.io/roborev/internal/daemon"
 	"go.kenn.io/roborev/internal/skills"
+	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/update"
 	"go.kenn.io/roborev/internal/version"
+)
+
+var (
+	checkForUpdateForCommand        = update.CheckForUpdate
+	performUpdateForCommand         = update.PerformUpdateWithReporter
+	prepareUpdateDaemonForCommand   = prepareUpdateDaemon
+	restartUpdatedDaemonForCommand  = restartAndVerifyUpdatedDaemon
+	repairHooksForUpdateCommand     = repairHooksAfterUpdateResult
+	updateSkillsForUpdateCommand    = updateSkillsAfterUpdateResult
+	installedSkillsForUpdateCommand = installedSkillsNeedUpdate
+	waitLegacyDaemonExitForCommand  = waitForLegacyDaemonExit
 )
 
 // waitForDaemonExit polls until the daemon with previousPID no longer
@@ -256,46 +273,15 @@ func restartDaemonAfterUpdate(binDir string, noRestart bool) {
 			)
 			return
 		}
-		// Treat as unresolved and continue to kill fallback.
+		// Treat the handoff as unresolved.
 		exited = false
 	}
 	if !exited {
-		// Forcefully kill orphaned/stuck daemon processes.
-		killAllDaemonsForUpdate()
-		exitedAfterKill, newPIDAfterKill := waitForDaemonExit(
-			previousPID, updateRestartWaitTimeout,
+		fmt.Printf(
+			"warning: daemon pid %d is still running;"+
+				" restart it manually\n", previousPID,
 		)
-		if newPIDAfterKill > 0 {
-			// Apply the same stop-failure safety gate here to avoid
-			// accepting a manager restart while other pre-update
-			// daemon runtimes are still present.
-			if stopFailed && (initialPIDsErr != nil || pidInSet(initialRuntimePIDs, newPIDAfterKill) || !initialPIDsExited(initialRuntimePIDs, newPIDAfterKill)) {
-				fmt.Println(
-					"warning: daemon restart detected but older daemon runtimes" +
-						" remain; restart it manually",
-				)
-				return
-			}
-			// Do not report success until the handoff daemon is responsive.
-			if waitForNewDaemonReady(updateRestartWaitTimeout) {
-				fmt.Println("OK")
-				return
-			}
-			// A replacement PID already exists; avoid manually starting
-			// another daemon instance while handoff is still warming up.
-			fmt.Println(
-				"warning: daemon handoff detected but replacement is not ready;" +
-					" restart it manually",
-			)
-			return
-		}
-		if !exitedAfterKill {
-			fmt.Printf(
-				"warning: daemon pid %d is still running;"+
-					" restart it manually\n", previousPID,
-			)
-			return
-		}
+		return
 	}
 
 	// stopDaemonForUpdate reported failure; do not manually start a new daemon
@@ -360,6 +346,14 @@ func repairHooksAfterUpdate(binDir string, noRestart bool, run repairHookRunner)
 		return
 	}
 
+	if err := repairHooksAfterUpdateResult(binDir, run); err != nil {
+		fmt.Printf("Updating git hooks... warning: %v\n", err)
+		return
+	}
+	fmt.Println("Updating git hooks... OK")
+}
+
+func repairHooksAfterUpdateResult(binDir string, run repairHookRunner) error {
 	newBinary := updatedRoborevBinary(binDir)
 	if run == nil {
 		run = func(opts repairHookOptions) error {
@@ -380,12 +374,10 @@ func repairHooksAfterUpdate(binDir string, noRestart bool, run repairHookRunner)
 		}
 	}
 
-	fmt.Print("Updating git hooks... ")
 	if err := run(repairHookOptions{registered: true, binary: newBinary}); err != nil {
-		fmt.Printf("warning: %v\n", err)
-		return
+		return err
 	}
-	fmt.Println("OK")
+	return nil
 }
 
 func installedSkillsNeedUpdate() bool {
@@ -397,11 +389,404 @@ func installedSkillsNeedUpdate() bool {
 	}, skills.IsInstalled)
 }
 
+func updateSkillsAfterUpdateResult(binDir string) error {
+	if !installedSkillsNeedUpdate() {
+		return nil
+	}
+	newBinary := updatedRoborevBinary(binDir)
+	cmd := exec.Command(newBinary, "skills", "update")
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	if detail := strings.TrimSpace(string(output)); detail != "" {
+		return fmt.Errorf("%w: %s", err, detail)
+	}
+	return err
+}
+
+func parseRunningReviewPolicy(raw string) (runningReviewPolicy, error) {
+	policy := runningReviewPolicy(strings.ToLower(strings.TrimSpace(raw)))
+	switch policy {
+	case policyWait, policyInterrupt, policyAbort, "":
+		return policy, nil
+	default:
+		return "", fmt.Errorf(
+			"invalid --running value %q: use wait, interrupt, or abort", raw,
+		)
+	}
+}
+
+func chooseRunningReviewPolicy(
+	in io.Reader, out io.Writer, running int,
+) (runningReviewPolicy, bool, error) {
+	fmt.Fprintf(out, "%d reviews are currently running.\n\n", running)
+	fmt.Fprintln(out, "  [w] Wait for them to finish, then update")
+	fmt.Fprintln(out, "  [u] Update now; interrupt and restart them automatically")
+	fmt.Fprintln(out, "  [a] Abort")
+	fmt.Fprint(out, "\nChoice [a]: ")
+	scanner := bufio.NewScanner(in)
+	answer := ""
+	if scanner.Scan() {
+		answer = scanner.Text()
+	} else if err := scanner.Err(); err != nil {
+		return "", false, err
+	}
+	switch strings.ToLower(strings.TrimSpace(answer)) {
+	case "w", "wait":
+		return policyWait, true, nil
+	case "u", "update", "interrupt":
+		return policyInterrupt, true, nil
+	default:
+		return "", false, nil
+	}
+}
+
+type commandUpdateReporter struct {
+	out           io.Writer
+	wroteProgress bool
+	lastPercent   int
+}
+
+func (r *commandUpdateReporter) Stepf(string, ...any) {}
+
+func (r *commandUpdateReporter) Progress(downloaded, total int64) {
+	if total <= 0 {
+		return
+	}
+	percent := int(downloaded * 100 / total)
+	if r.wroteProgress && percent == r.lastPercent {
+		return
+	}
+	r.wroteProgress = true
+	r.lastPercent = percent
+	fmt.Fprintf(r.out, "\r%-13s%d%% (%s)", "Downloading", percent, update.FormatSize(total))
+}
+
+func (r *commandUpdateReporter) Finish(total int64, success bool) {
+	if r.wroteProgress {
+		fmt.Fprintln(r.out)
+		return
+	}
+	if success {
+		printUpdatePhase(r.out, "Downloading", fmt.Sprintf("100%% (%s)", update.FormatSize(total)))
+	}
+}
+
+func printUpdateSummary(out io.Writer, info *update.UpdateInfo, installPath string) {
+	fmt.Fprintln(out, "Update available")
+	fmt.Fprintf(out, "  Version  %s -> %s\n", info.CurrentVersion, info.LatestVersion)
+	fmt.Fprintf(out, "  Package  %s (%s)\n", info.AssetName, update.FormatSize(info.Size))
+	fmt.Fprintf(out, "  Install  %s\n", installPath)
+	if verbose {
+		fmt.Fprintf(out, "  URL      %s\n", info.DownloadURL)
+		if info.Checksum != "" {
+			fmt.Fprintf(out, "  SHA256   %s\n", info.Checksum)
+		}
+	}
+}
+
+func printUpdatePhase(out io.Writer, phase, result string) {
+	fmt.Fprintf(out, "%-13s%s\n", phase, result)
+}
+
+func runControlledUpdate(
+	ctx context.Context,
+	in io.Reader,
+	out io.Writer,
+	info *update.UpdateInfo,
+	binDir string,
+	policy runningReviewPolicy,
+	yes bool,
+	noRestart bool,
+) error {
+	var runningDaemon *daemon.RuntimeInfo
+	var session *updateDaemonSession
+	confirmed := yes
+
+	if !noRestart {
+		var err error
+		runningDaemon, err = discoverDaemonForUpdate()
+		if err != nil {
+			return err
+		}
+	}
+
+	if runningDaemon != nil {
+		status, err := fetchDaemonStatus(ctx, runningDaemon.Endpoint())
+		if err != nil {
+			return err
+		}
+		if policy == "" && !yes && status.RunningJobs > 0 {
+			var selected bool
+			policy, selected, err = chooseRunningReviewPolicy(
+				in, out, int(status.RunningJobs),
+			)
+			if err != nil {
+				return err
+			}
+			if !selected {
+				fmt.Fprintln(out, "Update cancelled")
+				return nil
+			}
+			confirmed = true
+		}
+		if policy == "" {
+			policy = policyWait
+		}
+	}
+
+	if !confirmed {
+		accepted, err := confirmUpdate(in, out)
+		if err != nil {
+			return err
+		}
+		if !accepted {
+			fmt.Fprintln(out, "Update cancelled")
+			return nil
+		}
+	}
+	fmt.Fprintln(out)
+
+	operationCtx, cancelOperation := context.WithCancel(ctx)
+	defer cancelOperation()
+	heartbeatFailure := make(chan error, 1)
+	var heartbeatMonitorDone chan struct{}
+	stopHeartbeat := func() {
+		if session != nil {
+			session.stopHeartbeat()
+		}
+		if heartbeatMonitorDone != nil {
+			<-heartbeatMonitorDone
+			heartbeatMonitorDone = nil
+		}
+	}
+	defer stopHeartbeat()
+	defer func() {
+		if session != nil && session.Prepared && !session.ShutdownOwned {
+			releaseCtx, cancel := context.WithTimeout(
+				context.WithoutCancel(ctx), 2*time.Second,
+			)
+			defer cancel()
+			_, _ = session.release(releaseCtx)
+		}
+	}()
+	prepareDaemon := func(info *daemon.RuntimeInfo) error {
+		prepared, err := prepareUpdateDaemonForCommand(
+			operationCtx,
+			info.Endpoint(),
+			storage.GenerateUUID(),
+			policy,
+			out,
+		)
+		if err != nil {
+			if errors.Is(err, errUpdateReviewsRunning) && policy == policyAbort {
+				return fmt.Errorf("update aborted because reviews are running: %w", err)
+			}
+			return err
+		}
+		session = prepared
+		heartbeat := session.startHeartbeat(operationCtx)
+		heartbeatMonitorDone = make(chan struct{})
+		go func() {
+			defer close(heartbeatMonitorDone)
+			if heartbeatErr, ok := <-heartbeat; ok && heartbeatErr != nil {
+				heartbeatFailure <- heartbeatErr
+				cancelOperation()
+			}
+		}()
+		if err := waitForPreparedDrain(operationCtx, session, out); err != nil {
+			return preferHeartbeatFailure(err, heartbeatFailure)
+		}
+		return nil
+	}
+	if runningDaemon == nil && !noRestart {
+		appeared, err := discoverDaemonForUpdate()
+		if err != nil {
+			return err
+		}
+		if appeared != nil {
+			runningDaemon = appeared
+			if policy == "" {
+				policy = policyWait
+			}
+		}
+	}
+	if runningDaemon != nil {
+		if err := prepareDaemon(runningDaemon); err != nil {
+			return err
+		}
+	}
+
+	if err := operationCtx.Err(); err != nil {
+		return preferHeartbeatFailure(err, heartbeatFailure)
+	}
+	reporter := &commandUpdateReporter{out: out}
+	installErr := performUpdateForCommand(operationCtx, info, reporter)
+	reporter.Finish(info.Size, installErr == nil)
+	if installErr != nil {
+		return fmt.Errorf("update failed: %w", preferHeartbeatFailure(installErr, heartbeatFailure))
+	}
+	printUpdatePhase(out, "Installing", "done")
+	if session != nil {
+		session.Installed = true
+	}
+
+	if err := operationCtx.Err(); err != nil {
+		return installedUpdateInterruption(session, preferHeartbeatFailure(err, heartbeatFailure))
+	}
+
+	if session == nil && !noRestart {
+		appeared, err := discoverDaemonForUpdate()
+		if err != nil {
+			return installedUpdateInterruption(session, err)
+		}
+		if appeared != nil {
+			runningDaemon = appeared
+			if policy == "" {
+				policy = policyWait
+			}
+			if err := prepareDaemon(runningDaemon); err != nil {
+				return installedUpdateInterruption(session, err)
+			}
+			session.Installed = true
+		}
+	}
+
+	removeLegacyDaemonBinary(binDir)
+	if noRestart {
+		printUpdatePhase(out, "Daemon", "skipped (--no-restart)")
+		printUpdatePhase(out, "Git hooks", "skipped (--no-restart)")
+		printUpdatePhase(out, "Skills", "skipped (--no-restart)")
+		fmt.Fprintf(out, "\nUpdated roborev to %s\n", info.LatestVersion)
+		return nil
+	}
+	if session == nil {
+		printUpdatePhase(out, "Daemon", "not running")
+	} else {
+		stopHeartbeat()
+		if err := operationCtx.Err(); err != nil {
+			return installedUpdateInterruption(session, preferHeartbeatFailure(err, heartbeatFailure))
+		}
+		if err := session.shutdown(operationCtx); err != nil {
+			return installedUpdateInterruption(session, err)
+		}
+		session.ShutdownOwned = true
+		if session.Legacy {
+			if err := waitLegacyDaemonExitForCommand(
+				operationCtx, runningDaemon.PID,
+			); err != nil {
+				return installedUpdateInterruption(session, err)
+			}
+		}
+		if err := restartUpdatedDaemonForCommand(
+			operationCtx, binDir, info.LatestVersion, runningDaemon,
+		); err != nil {
+			if errors.Is(err, context.Canceled) || operationCtx.Err() != nil {
+				return installedUpdateInterruption(session, err)
+			}
+			return fmt.Errorf(
+				"restart updated daemon: %w; run roborev daemon restart", err,
+			)
+		}
+		printUpdatePhase(out, "Daemon", "restarted ("+info.LatestVersion+")")
+	}
+
+	if err := repairHooksForUpdateCommand(binDir, nil); err != nil {
+		printUpdatePhase(out, "Git hooks", "warning: "+err.Error())
+	} else {
+		printUpdatePhase(out, "Git hooks", "done")
+	}
+	if err := operationCtx.Err(); err != nil {
+		return installedUpdateInterruption(session, err)
+	}
+	if !installedSkillsForUpdateCommand() {
+		printUpdatePhase(out, "Skills", "not installed")
+	} else if err := updateSkillsForUpdateCommand(binDir); err != nil {
+		printUpdatePhase(out, "Skills", "warning: "+err.Error())
+	} else {
+		printUpdatePhase(out, "Skills", "done")
+	}
+	if err := operationCtx.Err(); err != nil {
+		return installedUpdateInterruption(session, err)
+	}
+	fmt.Fprintf(out, "\nUpdated roborev to %s\n", info.LatestVersion)
+	return nil
+}
+
+func discoverDaemonForUpdate() (*daemon.RuntimeInfo, error) {
+	info, probeErr := getAnyRunningDaemon()
+	if probeErr == nil {
+		return info, nil
+	}
+	runtimes, listErr := listAllRuntimes()
+	if listErr != nil {
+		return nil, fmt.Errorf("inspect daemon runtimes: %w", listErr)
+	}
+	for _, runtimeInfo := range runtimes {
+		if runtimeInfo == nil || runtimeInfo.PID <= 0 {
+			continue
+		}
+		if isPIDAliveForUpdate(runtimeInfo.PID) {
+			return nil, fmt.Errorf("running daemon is not responsive: %w", probeErr)
+		}
+		if runtimeInfo.SourcePath != "" {
+			_ = os.Remove(runtimeInfo.SourcePath)
+		}
+	}
+	return nil, nil
+}
+
+func confirmUpdate(in io.Reader, out io.Writer) (bool, error) {
+	fmt.Fprint(out, "\nProceed with update? [y/N] ")
+	scanner := bufio.NewScanner(in)
+	if !scanner.Scan() {
+		return false, scanner.Err()
+	}
+	response := strings.ToLower(strings.TrimSpace(scanner.Text()))
+	return response == "y" || response == "yes", nil
+}
+
+func preferHeartbeatFailure(err error, heartbeatFailure <-chan error) error {
+	select {
+	case heartbeatErr := <-heartbeatFailure:
+		if heartbeatErr != nil {
+			return heartbeatErr
+		}
+	default:
+	}
+	return err
+}
+
+func installedUpdateInterruption(session *updateDaemonSession, cause error) error {
+	if session != nil && session.ShutdownOwned {
+		return fmt.Errorf(
+			"binary installed; daemon is finishing shutdown — run roborev daemon restart: %w",
+			cause,
+		)
+	}
+	return fmt.Errorf(
+		"binary installed; daemon still running old version — run roborev daemon restart: %w",
+		cause,
+	)
+}
+
+func removeLegacyDaemonBinary(binDir string) {
+	oldDaemonPath := filepath.Join(binDir, "roborevd")
+	if runtime.GOOS == "windows" {
+		oldDaemonPath += ".exe"
+	}
+	if _, err := os.Stat(oldDaemonPath); err == nil {
+		_ = os.Remove(oldDaemonPath)
+	}
+}
+
 func updateCmd() *cobra.Command {
 	var checkOnly bool
 	var yes bool
 	var force bool
 	var noRestart bool
+	var runningPolicy string
 
 	cmd := &cobra.Command{
 		Use:   "update",
@@ -417,31 +802,22 @@ official release over a dev build.
 Use --no-restart when daemon lifecycle is managed externally (for example,
 launchd or systemd).`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Println("Checking for updates...")
+			policy, err := parseRunningReviewPolicy(runningPolicy)
+			if err != nil {
+				return err
+			}
+			out := cmd.OutOrStdout()
+			in := cmd.InOrStdin()
 
 			// kit already wraps check errors with "check for updates:".
-			info, err := update.CheckForUpdate(true) // Force check, ignore cache
+			info, err := checkForUpdateForCommand(true) // Force check, ignore cache
 			if err != nil {
 				return err
 			}
 
 			if info == nil {
-				fmt.Printf("Already running latest version (%s)\n", version.Version)
+				fmt.Fprintf(out, "Already running latest version (%s)\n", version.Version)
 				return nil
-			}
-
-			fmt.Printf("\n  Current version: %s\n", info.CurrentVersion)
-			fmt.Printf("  Latest version:  %s\n", info.LatestVersion)
-			if info.IsDevBuild {
-				fmt.Println("\nYou're running a dev build. Latest official release available.")
-			} else {
-				fmt.Println("\nUpdate available!")
-			}
-			fmt.Println("\nDownload:")
-			fmt.Printf("  URL:  %s\n", info.DownloadURL)
-			fmt.Printf("  Size: %s\n", update.FormatSize(info.Size))
-			if info.Checksum != "" {
-				fmt.Printf("  SHA256: %s\n", info.Checksum)
 			}
 
 			// Show install location
@@ -451,98 +827,27 @@ launchd or systemd).`,
 			}
 			currentExe, _ = filepath.EvalSymlinks(currentExe)
 			binDir := filepath.Dir(currentExe)
-
-			fmt.Println("\nInstall location:")
-			fmt.Printf("  %s\n", binDir)
+			printUpdateSummary(out, info, binDir)
 
 			if checkOnly {
 				if info.IsDevBuild {
-					fmt.Println("\nUse --force to install the latest official release.")
+					fmt.Fprintln(out, "\nUse --force to install the latest official release.")
 				}
 				return nil
 			}
 
 			// Dev builds require --force to update
 			if info.IsDevBuild && !force {
-				fmt.Println("\nUse --force to install the latest official release.")
+				fmt.Fprintln(out, "\nUse --force to install the latest official release.")
 				return nil
 			}
 
-			// Confirm
-			if !yes {
-				fmt.Print("\nProceed with update? [y/N] ")
-				var response string
-				_, _ = fmt.Scanln(&response)
-				if strings.ToLower(response) != "y" && strings.ToLower(response) != "yes" {
-					fmt.Println("Update cancelled")
-					return nil
-				}
-			}
-
-			fmt.Println()
-
-			// Progress display
-			var lastPercent int
-			progressFn := func(downloaded, total int64) {
-				if total > 0 {
-					percent := int(downloaded * 100 / total)
-					if percent != lastPercent {
-						fmt.Printf("\rDownloading... %d%% (%s / %s)",
-							percent, update.FormatSize(downloaded), update.FormatSize(total))
-						lastPercent = percent
-					}
-				}
-			}
-
-			// Perform update
-			if err := update.PerformUpdate(info, progressFn); err != nil {
-				return fmt.Errorf("update failed: %w", err)
-			}
-
-			fmt.Printf("\nUpdated to %s\n", info.LatestVersion)
-
-			// Clean up old roborevd binary if it exists (consolidated into roborev)
-			oldDaemonPath := filepath.Join(binDir, "roborevd")
-			if runtime.GOOS == "windows" {
-				oldDaemonPath += ".exe"
-			}
-			if _, err := os.Stat(oldDaemonPath); err == nil {
-				fmt.Print("Removing old roborevd binary... ")
-				if err := os.Remove(oldDaemonPath); err != nil {
-					fmt.Printf("warning: %v\n", err)
-				} else {
-					fmt.Println("OK")
-				}
-			}
-
-			restartDaemonAfterUpdate(binDir, noRestart)
-			repairHooksAfterUpdate(binDir, noRestart, nil)
-
-			// Update skills using the NEW binary (current process has old embedded skills)
-			// Use "skills update" to only update agents that already have skills installed
-			if installedSkillsNeedUpdate() {
-				fmt.Print("Updating skills... ")
-				newBinary := updatedRoborevBinary(binDir)
-				skillsCmd := exec.Command(newBinary, "skills", "update")
-				if output, err := skillsCmd.CombinedOutput(); err != nil {
-					fmt.Printf("warning: %v\n", err)
-				} else {
-					// Parse output to show what changed
-					lines := strings.SplitSeq(strings.TrimSpace(string(output)), "\n")
-					found := false
-					for line := range lines {
-						if strings.Contains(line, "updated") || strings.Contains(line, "installed") {
-							fmt.Println(line)
-							found = true
-						}
-					}
-					if !found {
-						fmt.Println("OK")
-					}
-				}
-			}
-
-			return nil
+			ctx, stopSignals := signal.NotifyContext(cmd.Context(), os.Interrupt)
+			defer stopSignals()
+			return runControlledUpdate(
+				ctx, in, out, info, binDir, policy,
+				yes, noRestart,
+			)
 		},
 	}
 
@@ -550,6 +855,7 @@ launchd or systemd).`,
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "skip confirmation prompt")
 	cmd.Flags().BoolVarP(&force, "force", "f", false, "replace dev build with latest official release")
 	cmd.Flags().BoolVar(&noRestart, "no-restart", false, "skip daemon restart after update (for launchd/systemd-managed daemons)")
+	cmd.Flags().StringVar(&runningPolicy, "running", "", "when reviews are running: wait, interrupt, or abort")
 
 	return cmd
 }

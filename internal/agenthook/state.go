@@ -5,11 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
-	"net/url"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -18,7 +19,6 @@ import (
 	gitrepo "go.kenn.io/kit/git/repo"
 
 	"go.kenn.io/roborev/internal/config"
-	roborevdaemon "go.kenn.io/roborev/internal/daemon"
 	roborevgit "go.kenn.io/roborev/internal/git"
 	"go.kenn.io/roborev/internal/storage"
 )
@@ -28,6 +28,7 @@ var agentHookGit = gitcmd.New()
 type hookScope struct {
 	WorktreeRoot        string
 	TrackedRepoRoot     string
+	TrackedRepoIdentity string
 	Head                string
 	Branch              string
 	WorktreeKey         string
@@ -36,7 +37,7 @@ type hookScope struct {
 	Tracked             bool
 }
 
-type trackedRepoResolution struct {
+type TrackedRepoResolution struct {
 	Tracked      bool
 	RootPath     string
 	Identity     string
@@ -52,11 +53,12 @@ type gitScope struct {
 	Branch       string
 }
 
-func LoadState() (*StateStore, error) {
+func LoadState(reviews ReviewSource) (*StateStore, error) {
 	path := StatePath()
 	s := &StateStore{
 		path:     path,
 		sessions: map[string]SessionState{},
+		reviews:  reviews,
 	}
 	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -117,21 +119,120 @@ func (s *StateStore) saveLocked() error {
 	return nil
 }
 
+// saveSessionLocked publishes a cloned session only when its atomic state-file
+// replacement succeeds. Callers must hold s.mu.
+func (s *StateStore) saveSessionLocked(sessionID string, state SessionState) error {
+	previous, existed := s.sessions[sessionID]
+	s.sessions[sessionID] = state
+	if err := s.saveLocked(); err != nil {
+		if existed {
+			s.sessions[sessionID] = previous
+		} else {
+			delete(s.sessions, sessionID)
+		}
+		return err
+	}
+	return nil
+}
+
 func (s *StateStore) Record(req Request) (Response, error) {
+	return s.RecordContext(context.Background(), req)
+}
+
+// Sessions returns an isolated snapshot of all tracked session state.
+func (s *StateStore) Sessions() map[string]SessionState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sessions := make(map[string]SessionState, len(s.sessions))
+	for id, state := range s.sessions {
+		sessions[id] = cloneSessionState(state)
+	}
+	return sessions
+}
+
+// Reset removes one session or all sessions and persists the updated snapshot.
+func (s *StateStore) Reset(sessionID string, all bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	previous := s.sessions
+	if all {
+		s.sessions = map[string]SessionState{}
+	} else {
+		s.sessions = maps.Clone(s.sessions)
+		delete(s.sessions, sessionID)
+	}
+	if err := s.saveLocked(); err != nil {
+		s.sessions = previous
+		return err
+	}
+	return nil
+}
+
+func cloneSessionState(state SessionState) SessionState {
+	state.StopCountsSincePrompt = maps.Clone(state.StopCountsSincePrompt)
+	state.CommitCountsSincePrompt = maps.Clone(state.CommitCountsSincePrompt)
+	state.FailedReviewTriggeredCounts = maps.Clone(state.FailedReviewTriggeredCounts)
+	state.AcknowledgedReviewIDs = maps.Clone(state.AcknowledgedReviewIDs)
+	for key, ids := range state.AcknowledgedReviewIDs {
+		state.AcknowledgedReviewIDs[key] = maps.Clone(ids)
+	}
+	state.RepoHeads = maps.Clone(state.RepoHeads)
+	state.WorktreeLineageKeys = maps.Clone(state.WorktreeLineageKeys)
+	state.PendingReminders = maps.Clone(state.PendingReminders)
+	state.CommitSHAsSincePrompt = maps.Clone(state.CommitSHAsSincePrompt)
+	for key, shas := range state.CommitSHAsSincePrompt {
+		state.CommitSHAsSincePrompt[key] = slices.Clone(shas)
+	}
+	return state
+}
+
+func (s *StateStore) RecordContext(ctx context.Context, req Request) (Response, error) {
+	if err := ctx.Err(); err != nil {
+		return Response{}, err
+	}
 	switch req.Event.HookEventName {
 	case "PreToolUse":
-		return s.recordPreToolUse(req)
+		return s.recordPreToolUse(ctx, req)
 	case "", "Stop":
-		return s.recordStop(req)
+		return s.recordStop(ctx, req)
 	case "PostToolUse":
-		return s.recordPostToolUse(req)
+		return s.recordPostToolUse(ctx, req)
 	default:
 		return Response{SessionID: req.Event.SessionID, Skipped: true}, nil
 	}
 }
 
-func (s *StateStore) recordStop(req Request) (Response, error) {
-	scope, ok := resolveHookScope(context.Background(), req.Event.CWD, req.RoborevServerAddr)
+func (s *StateStore) recordStop(ctx context.Context, req Request) (Response, error) {
+	if req.Event.StopHookActive {
+		s.mu.Lock()
+		st := s.sessions[req.Event.SessionID]
+		s.mu.Unlock()
+		return Response{
+			SessionID:             req.Event.SessionID,
+			Count:                 st.Count,
+			Threshold:             req.Threshold,
+			FailedReviewCount:     st.FailedReviewCount,
+			FailedReviewThreshold: req.FailedReviewThreshold,
+			ReminderPromptCount:   st.ReminderPromptCount,
+			Skipped:               true,
+		}, nil
+	}
+	scope, ok := s.resolveHookScope(ctx, req.Event.CWD)
+	snoozed := ok && scope.SnoozedUntil.After(time.Now())
+	var prepare func(*SessionState) Response
+	if snoozed {
+		prepare = func(st *SessionState) Response {
+			return applySnoozedState(st, req, scope)
+		}
+	}
+	if resp, delivered, err := s.deliverPendingReminder(ctx, req, prepare); err != nil || delivered {
+		return resp, err
+	}
+	if snoozed {
+		return s.recordSnoozed(ctx, req, scope)
+	}
 	if !ok {
 		return Response{
 			SessionID:             req.Event.SessionID,
@@ -148,29 +249,20 @@ func (s *StateStore) recordStop(req Request) (Response, error) {
 			Skipped:               true,
 		}, nil
 	}
-	if scope.SnoozedUntil.After(time.Now()) {
-		return s.recordSnoozed(req, scope)
-	}
-	failedReviewCount, haveFailedReviewCount := countOpenFailedReviews(
-		context.Background(), scope.TrackedRepoRoot, scope.Branch, scope.Head, req.RoborevServerAddr,
+	openFailedReviewIDs, haveFailedReviewCount := findOpenFailedReviewIDs(
+		ctx, s.reviews, scope.TrackedRepoRoot, scope.Branch, scope.Head,
 	)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	st := s.sessions[req.Event.SessionID]
-	lineageKey := ensureLineageKey(&st, scope)
-	if req.Event.StopHookActive {
-		return Response{
-			SessionID:             req.Event.SessionID,
-			Count:                 st.Count,
-			Threshold:             req.Threshold,
-			FailedReviewCount:     st.FailedReviewCount,
-			FailedReviewThreshold: req.FailedReviewThreshold,
-			ReminderPromptCount:   st.ReminderPromptCount,
-			Skipped:               true,
-		}, nil
+	if err := ctx.Err(); err != nil {
+		return Response{}, err
 	}
+
+	st := cloneSessionState(s.sessions[req.Event.SessionID])
+	lineageKey := ensureLineageKey(&st, scope)
+	actionableReviewIDs := unacknowledgedReviewIDs(st, lineageKey, openFailedReviewIDs)
+	failedReviewCount := len(actionableReviewIDs)
 
 	now := time.Now().UTC()
 	st.Count++
@@ -191,15 +283,27 @@ func (s *StateStore) recordStop(req Request) (Response, error) {
 	}
 	failedReviewTriggered := applyFailedReviewTrigger(
 		req, &st, scope.TrackedRepoRoot, scope.Branch, lineageKey,
-		failedReviewCount, haveFailedReviewCount, now,
+		failedReviewCount, haveFailedReviewCount,
 	)
 	promptTriggered := stopTriggered || failedReviewTriggered
 	if promptTriggered {
+		acknowledgeReviewIDs(&st, lineageKey, actionableReviewIDs)
+		delete(st.FailedReviewTriggeredCounts, lineageKey)
 		st.ReminderPromptCount++
+		if failedReviewTriggered {
+			st.FailedReviewTriggeredAt = now
+		}
 		resetPromptCountersForKeys(&st, promptResetKeys(scope, lineageKey))
+		for key, pending := range st.PendingReminders {
+			if pending.LineageKey == lineageKey {
+				delete(st.PendingReminders, key)
+			}
+		}
 	}
-	s.sessions[req.Event.SessionID] = st
-	if err := s.saveLocked(); err != nil {
+	if err := ctx.Err(); err != nil {
+		return Response{}, err
+	}
+	if err := s.saveSessionLocked(req.Event.SessionID, st); err != nil {
 		return Response{}, err
 	}
 
@@ -215,15 +319,15 @@ func (s *StateStore) recordStop(req Request) (Response, error) {
 	switch {
 	case failedReviewTriggered:
 		resp.TriggeredBy = "failed_reviews"
-		resp.Reason = buildFailedReviewReason(req, st)
+		resp.Reason = buildFailedReviewReason(req, st, actionableReviewIDs)
 	case stopTriggered:
 		resp.TriggeredBy = "stop"
-		resp.Reason = buildStopReason(req, stopCountSincePrompt)
+		resp.Reason = buildStopReason(req, stopCountSincePrompt, actionableReviewIDs)
 	}
 	return resp, nil
 }
 
-func (s *StateStore) recordPreToolUse(req Request) (Response, error) {
+func (s *StateStore) recordPreToolUse(ctx context.Context, req Request) (Response, error) {
 	if !isShellCommandTool(req.Event.ToolName) {
 		return Response{
 			SessionID:             req.Event.SessionID,
@@ -241,7 +345,7 @@ func (s *StateStore) recordPreToolUse(req Request) (Response, error) {
 		}, nil
 	}
 
-	scope, ok := resolveHookScope(context.Background(), commandGitDir(req.Event.CWD, req.Event.Command()), req.RoborevServerAddr)
+	scope, ok := s.resolveHookScope(ctx, commandGitDir(req.Event.CWD, req.Event.Command()))
 	if !ok {
 		return Response{
 			SessionID:             req.Event.SessionID,
@@ -251,13 +355,16 @@ func (s *StateStore) recordPreToolUse(req Request) (Response, error) {
 		}, nil
 	}
 	if scope.SnoozedUntil.After(time.Now()) {
-		return s.recordSnoozed(req, scope)
+		return s.recordSnoozed(ctx, req, scope)
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return Response{}, err
+	}
 
-	st := s.sessions[req.Event.SessionID]
+	st := cloneSessionState(s.sessions[req.Event.SessionID])
 	if st.RepoHeads == nil {
 		st.RepoHeads = map[string]string{}
 	}
@@ -265,8 +372,10 @@ func (s *StateStore) recordPreToolUse(req Request) (Response, error) {
 	recordSequenceHeads(&st, scope, commitSequenceKeys(scope, lineageKey))
 	st.LastCWD = req.Event.CWD
 	st.LastSeenAt = time.Now().UTC()
-	s.sessions[req.Event.SessionID] = st
-	if err := s.saveLocked(); err != nil {
+	if err := ctx.Err(); err != nil {
+		return Response{}, err
+	}
+	if err := s.saveSessionLocked(req.Event.SessionID, st); err != nil {
 		return Response{}, err
 	}
 
@@ -277,7 +386,7 @@ func (s *StateStore) recordPreToolUse(req Request) (Response, error) {
 	}, nil
 }
 
-func (s *StateStore) recordPostToolUse(req Request) (Response, error) {
+func (s *StateStore) recordPostToolUse(ctx context.Context, req Request) (Response, error) {
 	if !isShellCommandTool(req.Event.ToolName) {
 		return Response{
 			SessionID:             req.Event.SessionID,
@@ -296,7 +405,7 @@ func (s *StateStore) recordPostToolUse(req Request) (Response, error) {
 		gitDir = commandGitDir(req.Event.CWD, command)
 	}
 
-	scope, ok := resolveHookScope(context.Background(), gitDir, req.RoborevServerAddr)
+	scope, ok := s.resolveHookScope(ctx, gitDir)
 	if !ok {
 		return Response{
 			SessionID:             req.Event.SessionID,
@@ -306,20 +415,24 @@ func (s *StateStore) recordPostToolUse(req Request) (Response, error) {
 		}, nil
 	}
 	if scope.SnoozedUntil.After(time.Now()) {
-		return s.recordSnoozed(req, scope)
+		return s.recordSnoozed(ctx, req, scope)
 	}
 
-	failedReviewCount, haveFailedReviewCount := 0, false
+	var openFailedReviewIDs reviewIDSet
+	haveFailedReviewCount := false
 	if scope.Tracked {
-		failedReviewCount, haveFailedReviewCount = countOpenFailedReviews(
-			context.Background(), scope.TrackedRepoRoot, scope.Branch, scope.Head, req.RoborevServerAddr,
+		openFailedReviewIDs, haveFailedReviewCount = findOpenFailedReviewIDs(
+			ctx, s.reviews, scope.TrackedRepoRoot, scope.Branch, scope.Head,
 		)
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return Response{}, err
+	}
 
-	st := s.sessions[req.Event.SessionID]
+	st := cloneSessionState(s.sessions[req.Event.SessionID])
 	if st.RepoHeads == nil {
 		st.RepoHeads = map[string]string{}
 	}
@@ -353,6 +466,9 @@ func (s *StateStore) recordPostToolUse(req Request) (Response, error) {
 				continue
 			}
 			newCommits, continuous := newCommitSHAs(scope.WorktreeRoot, previousHead, scope.Head)
+			if err := ctx.Err(); err != nil {
+				return Response{}, err
+			}
 			if !continuous {
 				if st.CommitSHAsSincePrompt == nil {
 					st.CommitSHAsSincePrompt = map[string][]string{}
@@ -393,6 +509,8 @@ func (s *StateStore) recordPostToolUse(req Request) (Response, error) {
 		st.LastCommitHead = scope.Head
 	}
 
+	actionableReviewIDs := unacknowledgedReviewIDs(st, lineageKey, openFailedReviewIDs)
+	failedReviewCount := len(actionableReviewIDs)
 	actionableReviews := hasActionableFailedReviews(failedReviewCount, haveFailedReviewCount)
 	// The commit reminder fires once this checkout's threshold is met and
 	// actionable failed reviews exist; it does not require a commit in this exact
@@ -406,20 +524,60 @@ func (s *StateStore) recordPostToolUse(req Request) (Response, error) {
 	// Capture this checkout's count before resetPromptCounters clears it, so the
 	// reminder text reports the triggering repo's commits, not session-wide totals.
 	triggeringCommitCount := commitCountSincePrompt
-	if commitTriggered {
+	if commitTriggered && !req.DeferPostToolReminder {
 		st.CommitTriggeredAt = now
 	}
 	failedReviewTriggered := applyFailedReviewTrigger(
 		req, &st, scope.TrackedRepoRoot, scope.Branch, lineageKey,
-		failedReviewCount, haveFailedReviewCount, now,
+		failedReviewCount, haveFailedReviewCount,
 	)
 	promptTriggered := commitTriggered || failedReviewTriggered
-	if promptTriggered {
+	if promptTriggered && req.DeferPostToolReminder {
+		if failedReviewTriggered {
+			queuePendingReminder(&st, PendingReminder{
+				TriggeredBy:         "failed_reviews",
+				Reason:              deferredReminderReason(buildFailedReviewReason(req, st, actionableReviewIDs), scope.WorktreeRoot),
+				Instruction:         req.Instruction,
+				TrackedRepoRoot:     scope.TrackedRepoRoot,
+				TrackedRepoIdentity: scope.TrackedRepoIdentity,
+				WorktreeRoot:        scope.WorktreeRoot,
+				Branch:              scope.Branch,
+				Head:                scope.Head,
+				LineageKey:          lineageKey,
+				FailedReviewCount:   failedReviewCount,
+				CreatedAt:           now,
+			})
+		}
+		if commitTriggered {
+			queuePendingReminder(&st, PendingReminder{
+				TriggeredBy:         "commit",
+				Reason:              deferredReminderReason(buildCommitReason(req, triggeringCommitCount, scope.WorktreeRoot, actionableReviewIDs), scope.WorktreeRoot),
+				Instruction:         req.Instruction,
+				TrackedRepoRoot:     scope.TrackedRepoRoot,
+				TrackedRepoIdentity: scope.TrackedRepoIdentity,
+				WorktreeRoot:        scope.WorktreeRoot,
+				Branch:              scope.Branch,
+				Head:                scope.Head,
+				LineageKey:          lineageKey,
+				CommitCount:         triggeringCommitCount,
+				FailedReviewCount:   failedReviewCount,
+				CreatedAt:           now,
+			})
+		}
+		resetPromptCountersForKeys(&st, promptResetKeys(scope, lineageKey))
+	} else if promptTriggered {
+		acknowledgeReviewIDs(&st, lineageKey, actionableReviewIDs)
+		delete(st.FailedReviewTriggeredCounts, lineageKey)
 		st.ReminderPromptCount++
+		if failedReviewTriggered {
+			st.FailedReviewTriggeredAt = now
+		}
 		resetPromptCountersForKeys(&st, promptResetKeys(scope, lineageKey))
 	}
-	s.sessions[req.Event.SessionID] = st
-	if err := s.saveLocked(); err != nil {
+	if err := ctx.Err(); err != nil {
+		return Response{}, err
+	}
+	if err := s.saveSessionLocked(req.Event.SessionID, st); err != nil {
 		return Response{}, err
 	}
 
@@ -432,44 +590,63 @@ func (s *StateStore) recordPostToolUse(req Request) (Response, error) {
 		FailedReviewCount:     st.FailedReviewCount,
 		FailedReviewThreshold: req.FailedReviewThreshold,
 		ReminderPromptCount:   st.ReminderPromptCount,
-		Triggered:             promptTriggered,
+		Triggered:             promptTriggered && !req.DeferPostToolReminder,
+	}
+	if req.DeferPostToolReminder {
+		return resp, nil
 	}
 	switch {
 	case failedReviewTriggered:
 		resp.TriggeredBy = "failed_reviews"
-		resp.Reason = buildFailedReviewReason(req, st)
+		resp.Reason = buildFailedReviewReason(req, st, actionableReviewIDs)
 	case commitTriggered:
 		resp.TriggeredBy = "commit"
-		resp.Reason = buildCommitReason(req, triggeringCommitCount, scope.WorktreeRoot)
+		resp.Reason = buildCommitReason(req, triggeringCommitCount, scope.WorktreeRoot, actionableReviewIDs)
 	}
 	return resp, nil
 }
 
-// recordSnoozed advances the checkout baselines without accumulating reminder
-// thresholds. Reviews keep running in the main daemon; only this agent-facing
-// hook response is suppressed. Advancing HEAD prevents commits made during the
-// snooze from producing an immediate catch-up reminder after it expires.
-func (s *StateStore) recordSnoozed(req Request, scope hookScope) (Response, error) {
+// recordSnoozed advances checkout baselines without accumulating reminder
+// thresholds. Review work continues; only agent-facing reminders are muted.
+func (s *StateStore) recordSnoozed(
+	ctx context.Context,
+	req Request,
+	scope hookScope,
+) (Response, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return Response{}, err
+	}
 
-	st := s.sessions[req.Event.SessionID]
-	lineageKey := ensureLineageKey(&st, scope)
+	st := cloneSessionState(s.sessions[req.Event.SessionID])
+	resp := applySnoozedState(&st, req, scope)
+	if err := ctx.Err(); err != nil {
+		return Response{}, err
+	}
+	if err := s.saveSessionLocked(req.Event.SessionID, st); err != nil {
+		return Response{}, err
+	}
+	return resp, nil
+}
+
+func applySnoozedState(st *SessionState, req Request, scope hookScope) Response {
+	lineageKey := ensureLineageKey(st, scope)
 	keys := uniqueStrings(append(
 		[]string{scope.WorktreeKey, lineageKey},
 		commitSequenceKeys(scope, lineageKey)...,
 	))
-	recordSequenceHeads(&st, scope, keys)
-	resetPromptCountersForKeys(&st, keys)
+	recordSequenceHeads(st, scope, keys)
+	resetPromptCountersForKeys(st, keys)
 	delete(st.FailedReviewTriggeredCounts, lineageKey)
+	for key, pending := range st.PendingReminders {
+		if pending.LineageKey == lineageKey {
+			delete(st.PendingReminders, key)
+		}
+	}
 	st.FailedReviewCount = 0
 	st.LastCWD = req.Event.CWD
 	st.LastSeenAt = time.Now().UTC()
-	s.sessions[req.Event.SessionID] = st
-	if err := s.saveLocked(); err != nil {
-		return Response{}, err
-	}
-
 	return Response{
 		SessionID:             req.Event.SessionID,
 		Count:                 st.Count,
@@ -479,7 +656,351 @@ func (s *StateStore) recordSnoozed(req Request, scope hookScope) (Response, erro
 		FailedReviewThreshold: req.FailedReviewThreshold,
 		ReminderPromptCount:   st.ReminderPromptCount,
 		Skipped:               true,
-	}, nil
+	}
+}
+
+func pendingReminderKey(reminder PendingReminder) string {
+	return reminder.LineageKey + "\x00" + reminder.TriggeredBy
+}
+
+func queuePendingReminder(st *SessionState, reminder PendingReminder) {
+	if st.PendingReminders == nil {
+		st.PendingReminders = map[string]PendingReminder{}
+	}
+	key := pendingReminderKey(reminder)
+	if existing, ok := st.PendingReminders[key]; ok {
+		reminder.CreatedAt = existing.CreatedAt
+		reminder.CommitCount += existing.CommitCount
+	}
+	st.PendingReminders[key] = reminder
+}
+
+func deferredReminderReason(reason, worktree string) string {
+	return fmt.Sprintf(
+		"%s The triggering worktree is %s; change to it before running roborev commands.",
+		strings.TrimSpace(reason), quoteReminderWorktree(worktree),
+	)
+}
+
+func quoteReminderWorktree(worktree string) string {
+	runes := []rune(worktree)
+	var quoted strings.Builder
+	quoted.WriteByte('"')
+	for i := 0; i < len(runes); {
+		switch runes[i] {
+		case '\\':
+			end := i
+			for end < len(runes) && runes[end] == '\\' {
+				end++
+			}
+			count := end - i
+			switch {
+			case end == len(runes):
+				quoted.WriteString(strings.Repeat(`\`, count*2))
+			case runes[end] == '"':
+				quoted.WriteString(strings.Repeat(`\`, count*2+1))
+				quoted.WriteByte('"')
+				end++
+			default:
+				quoted.WriteString(strings.Repeat(`\`, count))
+			}
+			i = end
+		case '"':
+			quoted.WriteString(`\"`)
+			i++
+		case '\n':
+			quoted.WriteString(`\n`)
+			i++
+		case '\r':
+			quoted.WriteString(`\r`)
+			i++
+		case '\t':
+			quoted.WriteString(`\t`)
+			i++
+		default:
+			if unicode.IsControl(runes[i]) {
+				fmt.Fprintf(&quoted, `\u%04x`, runes[i])
+			} else {
+				quoted.WriteRune(runes[i])
+			}
+			i++
+		}
+	}
+	quoted.WriteByte('"')
+	return quoted.String()
+}
+
+type pendingReminderCandidate struct {
+	key      string
+	reminder PendingReminder
+}
+
+func (s *StateStore) deliverPendingReminder(
+	ctx context.Context,
+	req Request,
+	prepare func(*SessionState) Response,
+) (Response, bool, error) {
+	s.mu.Lock()
+	st := s.sessions[req.Event.SessionID]
+	candidates := make([]pendingReminderCandidate, 0, len(st.PendingReminders))
+	for key, reminder := range st.PendingReminders {
+		candidates = append(candidates, pendingReminderCandidate{key: key, reminder: reminder})
+	}
+	s.mu.Unlock()
+	sort.Slice(candidates, func(i, j int) bool {
+		left, right := candidates[i], candidates[j]
+		leftPriority := pendingReminderPriority(left.reminder.TriggeredBy)
+		rightPriority := pendingReminderPriority(right.reminder.TriggeredBy)
+		if leftPriority != rightPriority {
+			return leftPriority < rightPriority
+		}
+		if !left.reminder.CreatedAt.Equal(right.reminder.CreatedAt) {
+			return left.reminder.CreatedAt.Before(right.reminder.CreatedAt)
+		}
+		return left.key < right.key
+	})
+
+	discards := make([]pendingReminderCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		pending := candidate.reminder
+		resolved, known := s.resolvePendingReminderRepo(ctx, pending)
+		if err := ctx.Err(); err != nil {
+			return Response{}, false, err
+		}
+		if known && (!resolved.Tracked || resolved.SnoozedUntil.After(time.Now())) {
+			discards = append(discards, candidate)
+			continue
+		}
+		if !pendingReminderLineageMatches(ctx, pending, resolved, known) {
+			if err := ctx.Err(); err != nil {
+				return Response{}, false, err
+			}
+			continue
+		}
+		openFailedReviewIDs, ok := findOpenFailedReviewIDs(
+			ctx, s.reviews, pending.TrackedRepoRoot, pending.Branch, pending.Head,
+		)
+		if err := ctx.Err(); err != nil {
+			return Response{}, false, err
+		}
+		if !ok {
+			continue
+		}
+		if len(openFailedReviewIDs) == 0 {
+			discards = append(discards, candidate)
+			continue
+		}
+
+		s.mu.Lock()
+		// Persistence is the at-most-once delivery boundary. The hook protocol
+		// has no acknowledgment, so cancellation observed after this point
+		// cannot safely distinguish a delivered response from a disconnect.
+		if err := ctx.Err(); err != nil {
+			s.mu.Unlock()
+			return Response{}, false, err
+		}
+		st = cloneSessionState(s.sessions[req.Event.SessionID])
+		applyPendingReminderDiscards(&st, discards)
+		current, ok := st.PendingReminders[candidate.key]
+		if !ok || current != candidate.reminder {
+			s.mu.Unlock()
+			continue
+		}
+		if prepare != nil {
+			prepare(&st)
+			current, ok = st.PendingReminders[candidate.key]
+			if !ok || current != candidate.reminder {
+				s.mu.Unlock()
+				continue
+			}
+		}
+		dedupeKey := pending.LineageKey
+		if dedupeKey == "" {
+			dedupeKey = repoHeadKey(pending.TrackedRepoRoot, pending.Branch)
+		}
+		actionableReviewIDs := unacknowledgedReviewIDs(st, dedupeKey, openFailedReviewIDs)
+		if len(actionableReviewIDs) == 0 {
+			delete(st.PendingReminders, candidate.key)
+			delete(st.FailedReviewTriggeredCounts, dedupeKey)
+			st.FailedReviewCount = 0
+			if err := s.saveSessionLocked(req.Event.SessionID, st); err != nil {
+				s.mu.Unlock()
+				return Response{}, false, err
+			}
+			s.mu.Unlock()
+			continue
+		}
+		pending.FailedReviewCount = len(actionableReviewIDs)
+		// Releases before v0.64 persisted only Reason. Preserve that custom
+		// instruction instead of rebuilding with the current default. Remove
+		// this fallback after v0.66 ships with the hook migration. See #1012.
+		if pending.Instruction != "" {
+			reasonReq := req
+			reasonReq.Instruction = pending.Instruction
+			switch pending.TriggeredBy {
+			case "failed_reviews":
+				pending.Reason = deferredReminderReason(buildFailedReviewReason(reasonReq, SessionState{
+					FailedReviewCount:      len(actionableReviewIDs),
+					LastFailedReviewRepo:   pending.TrackedRepoRoot,
+					LastFailedReviewBranch: pending.Branch,
+				}, actionableReviewIDs), pending.WorktreeRoot)
+			case "commit":
+				pending.Reason = deferredReminderReason(buildCommitReason(
+					reasonReq, pending.CommitCount, pending.TrackedRepoRoot, actionableReviewIDs,
+				), pending.WorktreeRoot)
+			}
+		} else {
+			pending.Reason += formatReviewJobIDs(actionableReviewIDs)
+		}
+		delete(st.PendingReminders, candidate.key)
+		acknowledgeReviewIDs(&st, dedupeKey, actionableReviewIDs)
+		delete(st.FailedReviewTriggeredCounts, dedupeKey)
+		st.ReminderPromptCount++
+		st.FailedReviewCount = len(actionableReviewIDs)
+		st.LastFailedReviewRepo = pending.TrackedRepoRoot
+		st.LastFailedReviewBranch = pending.Branch
+		now := time.Now().UTC()
+		switch pending.TriggeredBy {
+		case "failed_reviews":
+			st.FailedReviewTriggeredAt = now
+		case "commit":
+			st.CommitTriggeredAt = now
+		}
+		if err := ctx.Err(); err != nil {
+			s.mu.Unlock()
+			return Response{}, false, err
+		}
+		err := s.saveSessionLocked(req.Event.SessionID, st)
+		s.mu.Unlock()
+		if err != nil {
+			return Response{}, false, err
+		}
+		return Response{
+			SessionID:             req.Event.SessionID,
+			Count:                 st.Count,
+			Threshold:             req.Threshold,
+			CommitCount:           pending.CommitCount,
+			CommitThreshold:       req.CommitThreshold,
+			FailedReviewCount:     pending.FailedReviewCount,
+			FailedReviewThreshold: req.FailedReviewThreshold,
+			ReminderPromptCount:   st.ReminderPromptCount,
+			Triggered:             true,
+			TriggeredBy:           pending.TriggeredBy,
+			Reason:                pending.Reason,
+		}, true, nil
+	}
+
+	if len(discards) == 0 && prepare == nil {
+		return Response{}, false, nil
+	}
+
+	s.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		s.mu.Unlock()
+		return Response{}, false, err
+	}
+	st = cloneSessionState(s.sessions[req.Event.SessionID])
+	changed := applyPendingReminderDiscards(&st, discards)
+	resp := Response{}
+	if prepare != nil {
+		resp = prepare(&st)
+		changed = true
+	}
+	if err := ctx.Err(); err != nil {
+		s.mu.Unlock()
+		return Response{}, false, err
+	}
+	if changed {
+		if err := s.saveSessionLocked(req.Event.SessionID, st); err != nil {
+			s.mu.Unlock()
+			return Response{}, false, err
+		}
+	}
+	s.mu.Unlock()
+	if prepare != nil {
+		return resp, true, nil
+	}
+	return Response{}, false, nil
+}
+
+func (s *StateStore) resolvePendingReminderRepo(
+	ctx context.Context,
+	pending PendingReminder,
+) (TrackedRepoResolution, bool) {
+	path := pending.WorktreeRoot
+	if path == "" {
+		path = pending.TrackedRepoRoot
+	}
+	if s.reviews == nil {
+		return TrackedRepoResolution{}, false
+	}
+	return s.reviews.ResolveTrackedRepo(ctx, path, pending.Branch)
+}
+
+func pendingReminderLineageMatches(
+	ctx context.Context,
+	pending PendingReminder,
+	resolved TrackedRepoResolution,
+	known bool,
+) bool {
+	current, ok := currentGitScopeContext(ctx, pending.WorktreeRoot)
+	if !ok {
+		return false
+	}
+	if filepath.Clean(current.WorktreeRoot) != filepath.Clean(pending.WorktreeRoot) ||
+		filepath.Clean(mainRepoRoot(ctx, current)) != filepath.Clean(pending.TrackedRepoRoot) {
+		return false
+	}
+	if !known || !resolved.Tracked {
+		return false
+	}
+	if resolved.RootPath != "" &&
+		filepath.Clean(resolved.RootPath) != filepath.Clean(pending.TrackedRepoRoot) {
+		return false
+	}
+	if pending.TrackedRepoIdentity != "" && resolved.Identity != pending.TrackedRepoIdentity {
+		return false
+	}
+	// A missing head does not provide enough information for a finer lineage check.
+	if pending.Head == "" {
+		return true
+	}
+	if pending.Branch != "" {
+		return current.Branch == pending.Branch
+	}
+	return current.Branch == "" && current.Head == pending.Head
+}
+
+func applyPendingReminderDiscards(
+	st *SessionState,
+	candidates []pendingReminderCandidate,
+) bool {
+	changed := false
+	for _, candidate := range candidates {
+		current, ok := st.PendingReminders[candidate.key]
+		if !ok || current != candidate.reminder {
+			continue
+		}
+		delete(st.PendingReminders, candidate.key)
+		dedupeKey := current.LineageKey
+		if dedupeKey == "" {
+			dedupeKey = repoHeadKey(current.TrackedRepoRoot, current.Branch)
+		}
+		delete(st.FailedReviewTriggeredCounts, dedupeKey)
+		if st.LastFailedReviewRepo == current.TrackedRepoRoot &&
+			st.LastFailedReviewBranch == current.Branch {
+			st.FailedReviewCount = 0
+		}
+		changed = true
+	}
+	return changed
+}
+
+func pendingReminderPriority(triggeredBy string) int {
+	if triggeredBy == "failed_reviews" {
+		return 0
+	}
+	return 1
 }
 
 func hasActionableFailedReviews(count int, ok bool) bool {
@@ -491,10 +1012,8 @@ func thresholdReady(countSincePrompt, threshold int) bool {
 }
 
 func isShellCommandTool(toolName string) bool {
-	// Claude: Bash. Droid: Execute. Grok Build: model-facing run_terminal_command
-	// (and internal run_terminal_cmd; Bash is a Claude-compat matcher alias).
 	switch toolName {
-	case "", "Bash", ExecuteMatcher, "run_terminal_command", "run_terminal_cmd":
+	case "", "Bash", "Execute", "run_terminal_command", "run_terminal_cmd":
 		return true
 	default:
 		return false
@@ -649,7 +1168,7 @@ func uniqueStrings(values []string) []string {
 }
 
 func applyFailedReviewTrigger(
-	req Request, st *SessionState, repoRoot, branch, lineageKey string, count int, ok bool, now time.Time,
+	req Request, st *SessionState, repoRoot, branch, lineageKey string, count int, ok bool,
 ) bool {
 	if !ok || req.FailedReviewThreshold <= 0 {
 		return false
@@ -675,12 +1194,12 @@ func applyFailedReviewTrigger(
 		st.FailedReviewTriggeredCounts = map[string]int{}
 	}
 	st.FailedReviewTriggeredCounts[key] = count
-	st.FailedReviewTriggeredAt = now
 	return true
 }
 
-func buildStopReason(req Request, count int) string {
-	return buildPromptReason(req, fmt.Sprintf("%s reached.", countPhrase(count, "Stop hook", "Stop hooks")))
+func buildStopReason(req Request, count int, reviewIDs reviewIDSet) string {
+	detail := fmt.Sprintf("%s reached.", countPhrase(count, "Stop hook", "Stop hooks"))
+	return buildPromptReason(req, detail+formatReviewJobIDs(reviewIDs))
 }
 
 // buildCommitReason describes the commit reminder for the checkout that triggered
@@ -688,22 +1207,57 @@ func buildStopReason(req Request, count int) string {
 // before it is reset), not the session-wide totals, so a deferred reminder for one
 // repo reports that repo and its count rather than whichever repo committed most
 // recently.
-func buildCommitReason(req Request, count int, repo string) string {
+func buildCommitReason(req Request, count int, repo string, reviewIDs reviewIDSet) string {
 	detail := fmt.Sprintf("%s reached", countPhrase(count, "commit", "commits"))
 	if repoName := quotedLabel(repoDisplayName(repo)); repoName != "" {
 		detail += " in " + repoName
 	}
-	return buildPromptReason(req, detail+".")
+	return buildPromptReason(req, detail+"."+formatReviewJobIDs(reviewIDs))
 }
 
-func buildFailedReviewReason(req Request, st SessionState) string {
+func buildFailedReviewReason(req Request, st SessionState, reviewIDs reviewIDSet) string {
 	detail := countPhrase(st.FailedReviewCount, "open failed roborev review", "open failed roborev reviews")
 	if branch := quotedLabel(st.LastFailedReviewBranch); branch != "" {
 		detail += " on " + branch
 	} else if repoName := quotedLabel(repoDisplayName(st.LastFailedReviewRepo)); repoName != "" {
 		detail += " in " + repoName
 	}
-	return buildPromptReason(req, detail+".")
+	return buildPromptReason(req, detail+"."+formatReviewJobIDs(reviewIDs))
+}
+
+// formatReviewJobIDs names the exact daemon-selected reviews in reminder context.
+func formatReviewJobIDs(reviewIDs reviewIDSet) string {
+	if len(reviewIDs) == 0 {
+		return ""
+	}
+	formatted := make([]string, 0, len(reviewIDs))
+	for _, id := range slices.Sorted(maps.Keys(reviewIDs)) {
+		formatted = append(formatted, fmt.Sprintf("%d", id))
+	}
+	return " Review job IDs: " + strings.Join(formatted, ", ") + "."
+}
+
+func unacknowledgedReviewIDs(st SessionState, lineageKey string, openReviewIDs reviewIDSet) reviewIDSet {
+	actionable := maps.Clone(openReviewIDs)
+	for id := range st.AcknowledgedReviewIDs[lineageKey] {
+		delete(actionable, id)
+	}
+	return actionable
+}
+
+func acknowledgeReviewIDs(st *SessionState, lineageKey string, reviewIDs reviewIDSet) {
+	if len(reviewIDs) == 0 {
+		return
+	}
+	if st.AcknowledgedReviewIDs == nil {
+		st.AcknowledgedReviewIDs = map[string]reviewIDSet{}
+	}
+	acknowledged := maps.Clone(st.AcknowledgedReviewIDs[lineageKey])
+	if acknowledged == nil {
+		acknowledged = reviewIDSet{}
+	}
+	maps.Copy(acknowledged, reviewIDs)
+	st.AcknowledgedReviewIDs[lineageKey] = acknowledged
 }
 
 // sanitizeLabel makes an untrusted git branch or repo (directory) name safe to
@@ -767,10 +1321,14 @@ func repoDisplayName(repoPath string) string {
 }
 
 func currentGitScope(cwd string) (gitScope, bool) {
+	return currentGitScopeContext(context.Background(), cwd)
+}
+
+func currentGitScopeContext(parent context.Context, cwd string) (gitScope, bool) {
 	if cwd == "" {
 		return gitScope{}, false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
 	defer cancel()
 	out, err := agentHookGit.Output(ctx, cwd,
 		"rev-parse", "--show-toplevel", "--git-dir", "--git-common-dir", "HEAD", "--abbrev-ref", "HEAD")
@@ -819,86 +1377,42 @@ func absGitPath(base, path string) string {
 	return filepath.Clean(path)
 }
 
-func resolveHookScope(ctx context.Context, cwd, configuredAddr string) (hookScope, bool) {
-	gitInfo, ok := currentGitScope(cwd)
+func (s *StateStore) resolveHookScope(ctx context.Context, cwd string) (hookScope, bool) {
+	gitInfo, ok := currentGitScopeContext(ctx, cwd)
 	if !ok {
 		return hookScope{}, false
 	}
-	trackedRoot := mainRepoRoot(gitInfo)
+	trackedRoot := mainRepoRoot(ctx, gitInfo)
+	trackedIdentity := ""
 	tracked := true
 	var snoozedUntil time.Time
-	if resolved, known := resolveTrackedRepo(
-		ctx, gitInfo.WorktreeRoot, gitInfo.Branch, configuredAddr,
-	); known {
-		if !resolved.Tracked {
-			tracked = false
-		} else if strings.TrimSpace(resolved.RootPath) != "" {
-			trackedRoot = strings.TrimSpace(resolved.RootPath)
+	if s.reviews != nil {
+		resolved, known := s.reviews.ResolveTrackedRepo(
+			ctx, gitInfo.WorktreeRoot, gitInfo.Branch,
+		)
+		if known {
+			if !resolved.Tracked {
+				tracked = false
+			} else if strings.TrimSpace(resolved.RootPath) != "" {
+				trackedRoot = strings.TrimSpace(resolved.RootPath)
+			}
+			trackedIdentity = strings.TrimSpace(resolved.Identity)
+			snoozedUntil = resolved.SnoozedUntil
 		}
-		snoozedUntil = resolved.SnoozedUntil
 	}
 	return hookScope{
-		WorktreeRoot:    gitInfo.WorktreeRoot,
-		TrackedRepoRoot: trackedRoot,
-		Head:            gitInfo.Head,
-		Branch:          gitInfo.Branch,
-		WorktreeKey:     worktreeSequenceKey(trackedRoot, gitInfo.WorktreeRoot),
+		WorktreeRoot:        gitInfo.WorktreeRoot,
+		TrackedRepoRoot:     trackedRoot,
+		TrackedRepoIdentity: trackedIdentity,
+		Head:                gitInfo.Head,
+		Branch:              gitInfo.Branch,
+		WorktreeKey:         worktreeSequenceKey(trackedRoot, gitInfo.WorktreeRoot),
 		CandidateLineageKey: lineageSequenceKey(
 			trackedRoot, gitInfo.Branch, gitInfo.WorktreeRoot, gitInfo.Head,
 		),
 		SnoozedUntil: snoozedUntil,
 		Tracked:      tracked,
 	}, true
-}
-
-func resolveTrackedRepo(
-	ctx context.Context, path, branch, configuredAddr string,
-) (trackedRepoResolution, bool) {
-	ep, ok := roborevEndpoint(configuredAddr)
-	if !ok {
-		return trackedRepoResolution{}, false
-	}
-	client := ep.HTTPClient(2 * time.Second)
-	values := url.Values{}
-	values.Set("path", path)
-	values.Set("branch", branch)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ep.BaseURL()+"/api/repos/resolve?"+values.Encode(), nil)
-	if err != nil {
-		return trackedRepoResolution{}, false
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return trackedRepoResolution{}, false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return trackedRepoResolution{}, false
-	}
-	var out struct {
-		Tracked *bool `json:"tracked"`
-		Repo    *struct {
-			RootPath              string     `json:"root_path"`
-			Identity              string     `json:"identity"`
-			Name                  string     `json:"name"`
-			AgentHookSnoozedUntil *time.Time `json:"agent_hook_snoozed_until,omitempty"`
-		} `json:"repo,omitempty"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return trackedRepoResolution{}, false
-	}
-	if out.Tracked == nil {
-		return trackedRepoResolution{}, false
-	}
-	resolved := trackedRepoResolution{Tracked: *out.Tracked}
-	if out.Repo != nil {
-		resolved.RootPath = out.Repo.RootPath
-		resolved.Identity = out.Repo.Identity
-		resolved.Name = out.Repo.Name
-		if out.Repo.AgentHookSnoozedUntil != nil {
-			resolved.SnoozedUntil = *out.Repo.AgentHookSnoozedUntil
-		}
-	}
-	return resolved, true
 }
 
 // mainRepoRoot resolves the main repository root for daemon API queries,
@@ -909,32 +1423,32 @@ func resolveTrackedRepo(
 // checkout root still drives branch and HEAD detection; only the repo filter
 // needs the main root. Falls back to worktreeRoot when resolution fails (for
 // example a plain checkout, where the two roots are identical).
-func mainRepoRoot(scope gitScope) string {
+func mainRepoRoot(ctx context.Context, scope gitScope) string {
 	if scope.GitDir == "" || scope.CommonDir == "" || scope.GitDir == scope.CommonDir {
 		return scope.WorktreeRoot
 	}
-	if bareCommonDir(scope.CommonDir) {
+	if bareCommonDir(ctx, scope.CommonDir) {
 		return scope.WorktreeRoot
 	}
 	if filepath.Base(scope.CommonDir) == ".git" {
 		return filepath.Dir(scope.CommonDir)
 	}
-	worktree := configuredWorktree(scope.CommonDir)
+	worktree := configuredWorktree(ctx, scope.CommonDir)
 	if worktree == "" {
 		return scope.WorktreeRoot
 	}
 	return worktree
 }
 
-func bareCommonDir(commonDir string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+func bareCommonDir(parent context.Context, commonDir string) bool {
+	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
 	defer cancel()
 	out, err := agentHookGit.Output(ctx, "", "config", "--file", filepath.Join(commonDir, "config"), "--bool", "core.bare")
 	return err == nil && strings.TrimSpace(string(out)) == "true"
 }
 
-func configuredWorktree(commonDir string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+func configuredWorktree(parent context.Context, commonDir string) string {
+	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
 	defer cancel()
 	out, err := agentHookGit.Output(ctx, "", "config", "--file", filepath.Join(commonDir, "config"), "core.worktree")
 	if err != nil {
@@ -1193,10 +1707,6 @@ func cleanShellToken(token string) string {
 	return strings.Trim(token, " \t\r\n'\"`;$&|(){}[]<>")
 }
 
-type jobsResponse struct {
-	Jobs []storage.ReviewJob `json:"jobs"`
-}
-
 // countsAsFailedReview reports whether job is a review whose F verdict should
 // drive the failed-review reminder. Review (single/range/dirty), synthesis, and
 // compact jobs produce meaningful P/F verdicts; task, insights, fix, and classify
@@ -1214,42 +1724,26 @@ func countsAsFailedReview(job storage.ReviewJob) bool {
 	}
 }
 
-func countOpenFailedReviews(ctx context.Context, repoRoot, branch, head, configuredAddr string) (int, bool) {
-	if repoRoot == "" {
-		return 0, false
+func countOpenFailedReviews(
+	ctx context.Context,
+	reviews ReviewSource,
+	repoRoot, branch, head string,
+) (int, bool) {
+	ids, ok := findOpenFailedReviewIDs(ctx, reviews, repoRoot, branch, head)
+	return len(ids), ok
+}
+
+func findOpenFailedReviewIDs(
+	ctx context.Context,
+	reviews ReviewSource,
+	repoRoot, branch, head string,
+) (reviewIDSet, bool) {
+	if repoRoot == "" || reviews == nil {
+		return nil, false
 	}
-	ep, ok := roborevEndpoint(configuredAddr)
+	jobs, ok := reviews.ListOpenReviewJobs(ctx, repoRoot, branch)
 	if !ok {
-		return 0, false
-	}
-	client := ep.HTTPClient(2 * time.Second)
-	values := url.Values{}
-	values.Set("repo", repoRoot)
-	if branch != "" {
-		values.Set("branch", branch)
-		values.Set("branch_include_empty", "true")
-	}
-	values.Set("status", "done")
-	values.Set("closed", "false")
-	values.Set("limit", "10000")
-	// Only job metadata is needed to count verdicts; full prompts would add
-	// tens of megabytes of JSON per hook event on busy repos.
-	values.Set("omit_prompt", "true")
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ep.BaseURL()+"/api/jobs?"+values.Encode(), nil)
-	if err != nil {
-		return 0, false
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return 0, false
-	}
-	var out jobsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return 0, false
+		return nil, false
 	}
 	var lineageMatcher *roborevgit.BranchLineageMatcher
 	lineageMatcherLoaded := false
@@ -1260,8 +1754,8 @@ func countOpenFailedReviews(ctx context.Context, repoRoot, branch, head, configu
 		}
 		return lineageMatcher != nil && lineageMatcher.Matches(ref)
 	}
-	count := 0
-	for _, job := range out.Jobs {
+	ids := make(reviewIDSet, len(jobs))
+	for _, job := range jobs {
 		if job.Status != "" && job.Status != storage.JobStatusDone {
 			continue
 		}
@@ -1275,10 +1769,10 @@ func countOpenFailedReviews(ctx context.Context, repoRoot, branch, head, configu
 			continue
 		}
 		if job.Verdict != nil && strings.EqualFold(*job.Verdict, "F") {
-			count++
+			ids[job.ID] = struct{}{}
 		}
 	}
-	return count, true
+	return ids, true
 }
 
 // failedReviewCountsForHead reports whether an open failed review returned by
@@ -1331,16 +1825,4 @@ func refReachableFromHead(repoRoot, ref, head string) bool {
 	}
 	ok, err := roborevgit.IsAncestor(repoRoot, ref, head)
 	return err == nil && ok
-}
-
-func roborevEndpoint(configuredAddr string) (roborevdaemon.DaemonEndpoint, bool) {
-	if configuredAddr != "" {
-		ep, err := roborevdaemon.ParseEndpoint(configuredAddr)
-		return ep, err == nil
-	}
-	info, err := roborevdaemon.GetAnyRunningDaemon()
-	if err != nil {
-		return roborevdaemon.DaemonEndpoint{}, false
-	}
-	return info.Endpoint(), true
 }

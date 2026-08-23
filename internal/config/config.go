@@ -2,11 +2,14 @@ package config
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"maps"
+	"net"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -14,6 +17,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/BurntSushi/toml"
 	tomlv2 "github.com/pelletier/go-toml/v2"
@@ -39,8 +43,7 @@ func (e *ConfigParseError) Unwrap() error { return e.Err }
 // IsConfigParseError reports whether err (or any error in its chain)
 // is a ConfigParseError.
 func IsConfigParseError(err error) bool {
-	var pe *ConfigParseError
-	if errors.As(err, &pe) {
+	if _, ok := errors.AsType[*ConfigParseError](err); ok {
 		return true
 	}
 	var syntaxErr toml.ParseError
@@ -85,7 +88,8 @@ type CodexConfig struct {
 }
 
 type PiConfig struct {
-	JSONSchemaExtension string `toml:"jsonschemaextension" comment:"Pi extension source for classifier JSON schema output."`
+	JSONSchemaExtension string   `toml:"jsonschemaextension" comment:"Pi extension source for classifier JSON schema output."`
+	LaunchArgs          []string `toml:"launch_args" comment:"Additional arguments prepended to every Pi invocation."`
 }
 
 type AgentConfig struct {
@@ -96,6 +100,18 @@ type AgentConfig struct {
 type CostConfig struct {
 	Endpoint string `toml:"endpoint" comment:"HTTP usage endpoint template for cost/token lookup. Use {session_id}; set empty to use agentsview CLI lookup only."`
 	Timeout  string `toml:"timeout" comment:"Timeout for HTTP usage endpoint lookups."`
+}
+
+const WebAuthModeProxy = "proxy"
+
+type WebConfig struct {
+	Enabled       bool   `toml:"enabled" comment:"Serve the browser application on a separate listener."`
+	Listen        string `toml:"listen" comment:"Loopback browser listener address. Port 0 selects an ephemeral port."`
+	PublicOrigin  string `toml:"public_origin" comment:"Exact HTTPS browser origin used by a reverse proxy."`
+	BasePath      string `toml:"base_path" comment:"Optional browser routing prefix; not a same-origin security boundary."`
+	AuthMode      string `toml:"auth_mode" comment:"Browser admission mode. Set proxy to trust an external access boundary."`
+	AuthToken     string `toml:"auth_token" sensitive:"true" comment:"Token exchanged for a process-local browser session."`
+	AuthTokenFile string `toml:"auth_token_file" comment:"Host-local file containing the browser auth token."`
 }
 
 // ResolvedTimeout returns the HTTP usage lookup timeout.
@@ -118,6 +134,7 @@ type Config struct {
 	ReviewContextCount         int    `toml:"review_context_count"`
 	ReuseReviewSessionLookback int    `toml:"reuse_review_session_lookback"` // 0 means no candidate cap
 	ReviewGuidelines           string `toml:"review_guidelines" comment:"Extra review instructions added to prompts globally."`
+	FixGuidelines              string `toml:"fix_guidelines" comment:"Policy for evaluating review findings during automated fixes."`
 	DefaultAgent               string `toml:"default_agent" comment:"Default agent when no workflow-specific agent is set."`
 	DefaultModel               string `toml:"default_model"` // Default model for agents (format varies by agent)
 	DefaultBackupAgent         string `toml:"default_backup_agent"`
@@ -125,9 +142,9 @@ type Config struct {
 	JobTimeoutMinutes          int    `toml:"job_timeout_minutes"`
 	HookTimeoutSeconds         int    `toml:"hook_timeout_seconds" comment:"Post-commit hook request timeout in seconds. 0 or negative uses the platform default (3 on most systems, 30 on Windows where git subprocess spawns are slow)."`
 	AgentQuotaCooldown         string `toml:"agent_quota_cooldown" comment:"Maximum daemon-wide cooldown after an agent quota error, as a Go duration such as 30m."`
-	ReviewReasoning            string `toml:"review_reasoning" comment:"Default reasoning level for reviews: fast, standard, medium, thorough, or maximum."`
-	RefineReasoning            string `toml:"refine_reasoning" comment:"Default reasoning level for refine: fast, standard, medium, thorough, or maximum."`
-	FixReasoning               string `toml:"fix_reasoning" comment:"Default reasoning level for fix: fast, standard, medium, thorough, or maximum."`
+	ReviewReasoning            string `toml:"review_reasoning" comment:"Default reasoning for reviews. Legacy: fast, standard, thorough, maximum. Exact: low, medium, high, xhigh, max."`
+	RefineReasoning            string `toml:"refine_reasoning" comment:"Default reasoning for refine. Legacy: fast, standard, thorough, maximum. Exact: low, medium, high, xhigh, max."`
+	FixReasoning               string `toml:"fix_reasoning" comment:"Default reasoning for fix. Legacy: fast, standard, thorough, maximum. Exact: low, medium, high, xhigh, max."`
 
 	// Analysis-type-specific agent/model configuration
 	Analyze map[string]AnalyzeConfig `toml:"analyze"`
@@ -135,69 +152,109 @@ type Config struct {
 	// Workflow-specific agent/model configuration
 	ReviewAgent           string `toml:"review_agent"`
 	ReviewAgentFast       string `toml:"review_agent_fast"`
+	ReviewAgentLow        string `toml:"review_agent_low"`
 	ReviewAgentStandard   string `toml:"review_agent_standard"`
 	ReviewAgentMedium     string `toml:"review_agent_medium"`
 	ReviewAgentThorough   string `toml:"review_agent_thorough"`
+	ReviewAgentHigh       string `toml:"review_agent_high"`
+	ReviewAgentXHigh      string `toml:"review_agent_xhigh"`
 	ReviewAgentMaximum    string `toml:"review_agent_maximum"`
+	ReviewAgentMax        string `toml:"review_agent_max"`
 	RefineAgent           string `toml:"refine_agent"`
 	RefineAgentFast       string `toml:"refine_agent_fast"`
+	RefineAgentLow        string `toml:"refine_agent_low"`
 	RefineAgentStandard   string `toml:"refine_agent_standard"`
 	RefineAgentMedium     string `toml:"refine_agent_medium"`
 	RefineAgentThorough   string `toml:"refine_agent_thorough"`
+	RefineAgentHigh       string `toml:"refine_agent_high"`
+	RefineAgentXHigh      string `toml:"refine_agent_xhigh"`
 	RefineAgentMaximum    string `toml:"refine_agent_maximum"`
+	RefineAgentMax        string `toml:"refine_agent_max"`
 	ReviewModel           string `toml:"review_model"`
 	ReviewModelFast       string `toml:"review_model_fast"`
+	ReviewModelLow        string `toml:"review_model_low"`
 	ReviewModelStandard   string `toml:"review_model_standard"`
 	ReviewModelMedium     string `toml:"review_model_medium"`
 	ReviewModelThorough   string `toml:"review_model_thorough"`
+	ReviewModelHigh       string `toml:"review_model_high"`
+	ReviewModelXHigh      string `toml:"review_model_xhigh"`
 	ReviewModelMaximum    string `toml:"review_model_maximum"`
+	ReviewModelMax        string `toml:"review_model_max"`
 	RefineModel           string `toml:"refine_model"`
 	RefineModelFast       string `toml:"refine_model_fast"`
+	RefineModelLow        string `toml:"refine_model_low"`
 	RefineModelStandard   string `toml:"refine_model_standard"`
 	RefineModelMedium     string `toml:"refine_model_medium"`
 	RefineModelThorough   string `toml:"refine_model_thorough"`
+	RefineModelHigh       string `toml:"refine_model_high"`
+	RefineModelXHigh      string `toml:"refine_model_xhigh"`
 	RefineModelMaximum    string `toml:"refine_model_maximum"`
+	RefineModelMax        string `toml:"refine_model_max"`
 	FixAgent              string `toml:"fix_agent"`
 	FixAgentFast          string `toml:"fix_agent_fast"`
+	FixAgentLow           string `toml:"fix_agent_low"`
 	FixAgentStandard      string `toml:"fix_agent_standard"`
 	FixAgentMedium        string `toml:"fix_agent_medium"`
 	FixAgentThorough      string `toml:"fix_agent_thorough"`
+	FixAgentHigh          string `toml:"fix_agent_high"`
+	FixAgentXHigh         string `toml:"fix_agent_xhigh"`
 	FixAgentMaximum       string `toml:"fix_agent_maximum"`
+	FixAgentMax           string `toml:"fix_agent_max"`
 	FixModel              string `toml:"fix_model"`
 	FixModelFast          string `toml:"fix_model_fast"`
+	FixModelLow           string `toml:"fix_model_low"`
 	FixModelStandard      string `toml:"fix_model_standard"`
 	FixModelMedium        string `toml:"fix_model_medium"`
 	FixModelThorough      string `toml:"fix_model_thorough"`
+	FixModelHigh          string `toml:"fix_model_high"`
+	FixModelXHigh         string `toml:"fix_model_xhigh"`
 	FixModelMaximum       string `toml:"fix_model_maximum"`
+	FixModelMax           string `toml:"fix_model_max"`
 	SecurityAgent         string `toml:"security_agent"`
 	SecurityAgentFast     string `toml:"security_agent_fast"`
+	SecurityAgentLow      string `toml:"security_agent_low"`
 	SecurityAgentStandard string `toml:"security_agent_standard"`
 	SecurityAgentMedium   string `toml:"security_agent_medium"`
 	SecurityAgentThorough string `toml:"security_agent_thorough"`
+	SecurityAgentHigh     string `toml:"security_agent_high"`
+	SecurityAgentXHigh    string `toml:"security_agent_xhigh"`
 	SecurityAgentMaximum  string `toml:"security_agent_maximum"`
+	SecurityAgentMax      string `toml:"security_agent_max"`
 	SecurityModel         string `toml:"security_model"`
 	SecurityModelFast     string `toml:"security_model_fast"`
+	SecurityModelLow      string `toml:"security_model_low"`
 	SecurityModelStandard string `toml:"security_model_standard"`
 	SecurityModelMedium   string `toml:"security_model_medium"`
 	SecurityModelThorough string `toml:"security_model_thorough"`
+	SecurityModelHigh     string `toml:"security_model_high"`
+	SecurityModelXHigh    string `toml:"security_model_xhigh"`
 	SecurityModelMaximum  string `toml:"security_model_maximum"`
+	SecurityModelMax      string `toml:"security_model_max"`
 	DesignAgent           string `toml:"design_agent"`
 	DesignAgentFast       string `toml:"design_agent_fast"`
+	DesignAgentLow        string `toml:"design_agent_low"`
 	DesignAgentStandard   string `toml:"design_agent_standard"`
 	DesignAgentMedium     string `toml:"design_agent_medium"`
 	DesignAgentThorough   string `toml:"design_agent_thorough"`
+	DesignAgentHigh       string `toml:"design_agent_high"`
+	DesignAgentXHigh      string `toml:"design_agent_xhigh"`
 	DesignAgentMaximum    string `toml:"design_agent_maximum"`
+	DesignAgentMax        string `toml:"design_agent_max"`
 	DesignModel           string `toml:"design_model"`
 	DesignModelFast       string `toml:"design_model_fast"`
+	DesignModelLow        string `toml:"design_model_low"`
 	DesignModelStandard   string `toml:"design_model_standard"`
 	DesignModelMedium     string `toml:"design_model_medium"`
 	DesignModelThorough   string `toml:"design_model_thorough"`
+	DesignModelHigh       string `toml:"design_model_high"`
+	DesignModelXHigh      string `toml:"design_model_xhigh"`
 	DesignModelMaximum    string `toml:"design_model_maximum"`
+	DesignModelMax        string `toml:"design_model_max"`
 
 	// Classify workflow (routing classifier for auto design review)
 	ClassifyAgent       string `toml:"classify_agent" comment:"Agent for the design-review routing classifier. Must implement SchemaAgent capability."`
 	ClassifyModel       string `toml:"classify_model" comment:"Model for the classifier agent. Empty = agent default."`
-	ClassifyReasoning   string `toml:"classify_reasoning" comment:"Reasoning level for the classifier: fast, standard, medium, thorough, or maximum."`
+	ClassifyReasoning   string `toml:"classify_reasoning" comment:"Reasoning for the classifier. Legacy: fast, standard, thorough, maximum. Exact: low, medium, high, xhigh, max."`
 	ClassifyBackupAgent string `toml:"classify_backup_agent" comment:"Fallback classifier agent on quota exhaustion / failure."`
 	ClassifyBackupModel string `toml:"classify_backup_model" comment:"Fallback classifier model."`
 
@@ -251,6 +308,9 @@ type Config struct {
 
 	// Cost/token usage lookup configuration
 	Cost CostConfig `toml:"cost"`
+
+	// Browser application configuration
+	Web WebConfig `toml:"web"`
 
 	// Agent-specific behavior
 	Agent AgentConfig `toml:"agent"`
@@ -367,7 +427,7 @@ func walkAgentReferences(value reflect.Value, path string) error {
 	typeOfValue := value.Type()
 	for i := range value.NumField() {
 		fieldType := typeOfValue.Field(i)
-		tag := strings.Split(fieldType.Tag.Get("toml"), ",")[0]
+		tag, _, _ := strings.Cut(fieldType.Tag.Get("toml"), ",")
 		if tag == "" || tag == "-" {
 			continue
 		}
@@ -439,9 +499,9 @@ type RepoConfig struct {
 	ExcludedBranches                []string `toml:"excluded_branches" comment:"Branches that should be skipped for automatic review in this repo."`
 	ExcludedCommitPatterns          []string `toml:"excluded_commit_patterns" comment:"Commit message substrings that should skip review for this repo."`
 	DisplayName                     string   `toml:"display_name" comment:"Display name shown for this repo in the TUI and output."`
-	ReviewReasoning                 string   `toml:"review_reasoning" comment:"Reasoning level for reviews in this repo: fast, standard, medium, thorough, or maximum."`
-	RefineReasoning                 string   `toml:"refine_reasoning" comment:"Reasoning level for refine in this repo: fast, standard, medium, thorough, or maximum."`
-	FixReasoning                    string   `toml:"fix_reasoning" comment:"Reasoning level for fix in this repo: fast, standard, medium, thorough, or maximum."`
+	ReviewReasoning                 string   `toml:"review_reasoning" comment:"Reasoning for reviews in this repo. Legacy: fast, standard, thorough, maximum. Exact: low, medium, high, xhigh, max."`
+	RefineReasoning                 string   `toml:"refine_reasoning" comment:"Reasoning for refine in this repo. Legacy: fast, standard, thorough, maximum. Exact: low, medium, high, xhigh, max."`
+	FixReasoning                    string   `toml:"fix_reasoning" comment:"Reasoning for fix in this repo. Legacy: fast, standard, thorough, maximum. Exact: low, medium, high, xhigh, max."`
 	FixMinSeverity                  string   `toml:"fix_min_severity" comment:"Minimum severity for fix in this repo: critical, high, medium, or low."`     // Minimum severity for fix: critical, high, medium, low
 	RefineMinSeverity               string   `toml:"refine_min_severity" comment:"Minimum severity for refine in this repo: critical, high, medium, low."`  // Minimum severity for refine: critical, high, medium, low
 	ReviewMinSeverity               string   `toml:"review_min_severity" comment:"Minimum severity for reviews in this repo: critical, high, medium, low."` // Minimum severity for review: critical, high, medium, low
@@ -468,64 +528,104 @@ type RepoConfig struct {
 	// Workflow-specific agent/model configuration
 	ReviewAgent           string `toml:"review_agent" comment:"Agent override for standard review in this repo."`
 	ReviewAgentFast       string `toml:"review_agent_fast" comment:"Agent override for fast review in this repo."`
+	ReviewAgentLow        string `toml:"review_agent_low" comment:"Agent override for low review in this repo."`
 	ReviewAgentStandard   string `toml:"review_agent_standard" comment:"Agent override for standard review in this repo."`
 	ReviewAgentMedium     string `toml:"review_agent_medium" comment:"Agent override for medium review in this repo."`
 	ReviewAgentThorough   string `toml:"review_agent_thorough" comment:"Agent override for thorough review in this repo."`
+	ReviewAgentHigh       string `toml:"review_agent_high" comment:"Agent override for high review in this repo."`
+	ReviewAgentXHigh      string `toml:"review_agent_xhigh" comment:"Agent override for xhigh review in this repo."`
 	ReviewAgentMaximum    string `toml:"review_agent_maximum" comment:"Agent override for maximum review in this repo."`
+	ReviewAgentMax        string `toml:"review_agent_max" comment:"Agent override for max review in this repo."`
 	RefineAgent           string `toml:"refine_agent" comment:"Agent override for refine in this repo."`
 	RefineAgentFast       string `toml:"refine_agent_fast" comment:"Agent override for fast refine in this repo."`
+	RefineAgentLow        string `toml:"refine_agent_low" comment:"Agent override for low refine in this repo."`
 	RefineAgentStandard   string `toml:"refine_agent_standard" comment:"Agent override for standard refine in this repo."`
 	RefineAgentMedium     string `toml:"refine_agent_medium" comment:"Agent override for medium refine in this repo."`
 	RefineAgentThorough   string `toml:"refine_agent_thorough" comment:"Agent override for thorough refine in this repo."`
+	RefineAgentHigh       string `toml:"refine_agent_high" comment:"Agent override for high refine in this repo."`
+	RefineAgentXHigh      string `toml:"refine_agent_xhigh" comment:"Agent override for xhigh refine in this repo."`
 	RefineAgentMaximum    string `toml:"refine_agent_maximum" comment:"Agent override for maximum refine in this repo."`
+	RefineAgentMax        string `toml:"refine_agent_max" comment:"Agent override for max refine in this repo."`
 	ReviewModel           string `toml:"review_model" comment:"Model override for standard review in this repo."`
 	ReviewModelFast       string `toml:"review_model_fast" comment:"Model override for fast review in this repo."`
+	ReviewModelLow        string `toml:"review_model_low" comment:"Model override for low review in this repo."`
 	ReviewModelStandard   string `toml:"review_model_standard" comment:"Model override for standard review in this repo."`
 	ReviewModelMedium     string `toml:"review_model_medium" comment:"Model override for medium review in this repo."`
 	ReviewModelThorough   string `toml:"review_model_thorough" comment:"Model override for thorough review in this repo."`
+	ReviewModelHigh       string `toml:"review_model_high" comment:"Model override for high review in this repo."`
+	ReviewModelXHigh      string `toml:"review_model_xhigh" comment:"Model override for xhigh review in this repo."`
 	ReviewModelMaximum    string `toml:"review_model_maximum" comment:"Model override for maximum review in this repo."`
+	ReviewModelMax        string `toml:"review_model_max" comment:"Model override for max review in this repo."`
 	RefineModel           string `toml:"refine_model" comment:"Model override for standard refine in this repo."`
 	RefineModelFast       string `toml:"refine_model_fast" comment:"Model override for fast refine in this repo."`
+	RefineModelLow        string `toml:"refine_model_low" comment:"Model override for low refine in this repo."`
 	RefineModelStandard   string `toml:"refine_model_standard" comment:"Model override for standard refine in this repo."`
 	RefineModelMedium     string `toml:"refine_model_medium" comment:"Model override for medium refine in this repo."`
 	RefineModelThorough   string `toml:"refine_model_thorough" comment:"Model override for thorough refine in this repo."`
+	RefineModelHigh       string `toml:"refine_model_high" comment:"Model override for high refine in this repo."`
+	RefineModelXHigh      string `toml:"refine_model_xhigh" comment:"Model override for xhigh refine in this repo."`
 	RefineModelMaximum    string `toml:"refine_model_maximum" comment:"Model override for maximum refine in this repo."`
+	RefineModelMax        string `toml:"refine_model_max" comment:"Model override for max refine in this repo."`
 	FixAgent              string `toml:"fix_agent" comment:"Agent override for fix in this repo."`
 	FixAgentFast          string `toml:"fix_agent_fast" comment:"Agent override for fast fix in this repo."`
+	FixAgentLow           string `toml:"fix_agent_low" comment:"Agent override for low fix in this repo."`
 	FixAgentStandard      string `toml:"fix_agent_standard" comment:"Agent override for standard fix in this repo."`
 	FixAgentMedium        string `toml:"fix_agent_medium" comment:"Agent override for medium fix in this repo."`
 	FixAgentThorough      string `toml:"fix_agent_thorough" comment:"Agent override for thorough fix in this repo."`
+	FixAgentHigh          string `toml:"fix_agent_high" comment:"Agent override for high fix in this repo."`
+	FixAgentXHigh         string `toml:"fix_agent_xhigh" comment:"Agent override for xhigh fix in this repo."`
 	FixAgentMaximum       string `toml:"fix_agent_maximum" comment:"Agent override for maximum fix in this repo."`
+	FixAgentMax           string `toml:"fix_agent_max" comment:"Agent override for max fix in this repo."`
 	FixModel              string `toml:"fix_model" comment:"Model override for standard fix in this repo."`
 	FixModelFast          string `toml:"fix_model_fast" comment:"Model override for fast fix in this repo."`
+	FixModelLow           string `toml:"fix_model_low" comment:"Model override for low fix in this repo."`
 	FixModelStandard      string `toml:"fix_model_standard" comment:"Model override for standard fix in this repo."`
 	FixModelMedium        string `toml:"fix_model_medium" comment:"Model override for medium fix in this repo."`
 	FixModelThorough      string `toml:"fix_model_thorough" comment:"Model override for thorough fix in this repo."`
+	FixModelHigh          string `toml:"fix_model_high" comment:"Model override for high fix in this repo."`
+	FixModelXHigh         string `toml:"fix_model_xhigh" comment:"Model override for xhigh fix in this repo."`
 	FixModelMaximum       string `toml:"fix_model_maximum" comment:"Model override for maximum fix in this repo."`
+	FixModelMax           string `toml:"fix_model_max" comment:"Model override for max fix in this repo."`
 	SecurityAgent         string `toml:"security_agent" comment:"Agent override for security review in this repo."`
 	SecurityAgentFast     string `toml:"security_agent_fast" comment:"Agent override for fast security review in this repo."`
+	SecurityAgentLow      string `toml:"security_agent_low" comment:"Agent override for low security review in this repo."`
 	SecurityAgentStandard string `toml:"security_agent_standard" comment:"Agent override for standard security review in this repo."`
 	SecurityAgentMedium   string `toml:"security_agent_medium" comment:"Agent override for medium security review in this repo."`
 	SecurityAgentThorough string `toml:"security_agent_thorough" comment:"Agent override for thorough security review in this repo."`
+	SecurityAgentHigh     string `toml:"security_agent_high" comment:"Agent override for high security review in this repo."`
+	SecurityAgentXHigh    string `toml:"security_agent_xhigh" comment:"Agent override for xhigh security review in this repo."`
 	SecurityAgentMaximum  string `toml:"security_agent_maximum" comment:"Agent override for maximum security review in this repo."`
+	SecurityAgentMax      string `toml:"security_agent_max" comment:"Agent override for max security review in this repo."`
 	SecurityModel         string `toml:"security_model" comment:"Model override for standard security review in this repo."`
 	SecurityModelFast     string `toml:"security_model_fast" comment:"Model override for fast security review in this repo."`
+	SecurityModelLow      string `toml:"security_model_low" comment:"Model override for low security review in this repo."`
 	SecurityModelStandard string `toml:"security_model_standard" comment:"Model override for standard security review in this repo."`
 	SecurityModelMedium   string `toml:"security_model_medium" comment:"Model override for medium security review in this repo."`
 	SecurityModelThorough string `toml:"security_model_thorough" comment:"Model override for thorough security review in this repo."`
+	SecurityModelHigh     string `toml:"security_model_high" comment:"Model override for high security review in this repo."`
+	SecurityModelXHigh    string `toml:"security_model_xhigh" comment:"Model override for xhigh security review in this repo."`
 	SecurityModelMaximum  string `toml:"security_model_maximum" comment:"Model override for maximum security review in this repo."`
+	SecurityModelMax      string `toml:"security_model_max" comment:"Model override for max security review in this repo."`
 	DesignAgent           string `toml:"design_agent" comment:"Agent override for design review in this repo."`
 	DesignAgentFast       string `toml:"design_agent_fast" comment:"Agent override for fast design review in this repo."`
+	DesignAgentLow        string `toml:"design_agent_low" comment:"Agent override for low design review in this repo."`
 	DesignAgentStandard   string `toml:"design_agent_standard" comment:"Agent override for standard design review in this repo."`
 	DesignAgentMedium     string `toml:"design_agent_medium" comment:"Agent override for medium design review in this repo."`
 	DesignAgentThorough   string `toml:"design_agent_thorough" comment:"Agent override for thorough design review in this repo."`
+	DesignAgentHigh       string `toml:"design_agent_high" comment:"Agent override for high design review in this repo."`
+	DesignAgentXHigh      string `toml:"design_agent_xhigh" comment:"Agent override for xhigh design review in this repo."`
 	DesignAgentMaximum    string `toml:"design_agent_maximum" comment:"Agent override for maximum design review in this repo."`
+	DesignAgentMax        string `toml:"design_agent_max" comment:"Agent override for max design review in this repo."`
 	DesignModel           string `toml:"design_model" comment:"Model override for standard design review in this repo."`
 	DesignModelFast       string `toml:"design_model_fast" comment:"Model override for fast design review in this repo."`
+	DesignModelLow        string `toml:"design_model_low" comment:"Model override for low design review in this repo."`
 	DesignModelStandard   string `toml:"design_model_standard" comment:"Model override for standard design review in this repo."`
 	DesignModelMedium     string `toml:"design_model_medium" comment:"Model override for medium design review in this repo."`
 	DesignModelThorough   string `toml:"design_model_thorough" comment:"Model override for thorough design review in this repo."`
+	DesignModelHigh       string `toml:"design_model_high" comment:"Model override for high design review in this repo."`
+	DesignModelXHigh      string `toml:"design_model_xhigh" comment:"Model override for xhigh design review in this repo."`
 	DesignModelMaximum    string `toml:"design_model_maximum" comment:"Model override for maximum design review in this repo."`
+	DesignModelMax        string `toml:"design_model_max" comment:"Model override for max design review in this repo."`
 
 	// Classify workflow (per-repo overrides)
 	ClassifyAgent       string `toml:"classify_agent" comment:"Override classifier agent for this repo."`
@@ -573,6 +673,13 @@ func (c *RepoConfig) UsesReviewMDFallback() bool {
 const (
 	DefaultPiJSONSchemaExtension = "npm:@nqbao/pi-json-schema@0.1.1"
 	DefaultAgentQuotaCooldown    = 30 * time.Minute
+	DefaultAgentHookInstruction  = `Invoke the roborev-fix skill for only the review job IDs named in this reminder.
+Do not discover or address any other reviews. Before editing, independently validate every finding
+against the current code and the user's current task; a review finding is not proof that a problem
+exists. Never expand the scope of that task. Fix and verify valid findings only when they are clearly
+within scope. For invalid, stale, already-resolved, or inapplicable findings, make no code change,
+record the evidence, and close the review. If a valid finding is outside the task or its scope is
+unclear, leave it open and ask the user for direction. Then continue the task that this hook interrupted.`
 
 	// DefaultHookTimeout bounds how long the post-commit hook waits for the
 	// daemon's enqueue handler before giving up so a stalled daemon never
@@ -604,17 +711,21 @@ func DefaultConfig() *Config {
 		Cost: CostConfig{
 			Timeout: "10s",
 		},
+		Web: WebConfig{
+			Enabled: true,
+			Listen:  "127.0.0.1:0",
+		},
 		AgentHook: AgentHookConfig{
 			TurnThreshold:         5,
 			CommitThreshold:       0,
 			FailedReviewThreshold: 4,
-			Instruction:           "Invoke the $roborev-fix skill now.",
+			Instruction:           DefaultAgentHookInstruction,
 		},
 		DroidHook: DroidHookConfig{
 			TurnThreshold:         5,
 			CommitThreshold:       0,
 			FailedReviewThreshold: 4,
-			Instruction:           "Run the roborev-fix skill to address the unresolved roborev findings, then continue.",
+			Instruction:           DefaultAgentHookInstruction,
 		},
 		KataContext: KataContextConfig{Mode: KataModeOff, MaxChars: defaultKataMaxChars},
 		Agent: AgentConfig{
@@ -671,15 +782,200 @@ func LoadGlobalFrom(path string) (*Config, error) {
 
 	// Migrate deprecated config keys
 	cfg.migrateDeprecated(md)
-	if err := validateConfig(cfg, cfg.ACP); err != nil {
-		return nil, fmt.Errorf("config: %w", err)
-	}
-
-	if err := cfg.CI.NormalizeInstallations(); err != nil {
+	if err := normalizeGlobalConfig(cfg); err != nil {
 		return nil, fmt.Errorf("config: %w", err)
 	}
 
 	return cfg, nil
+}
+
+func normalizeGlobalConfig(cfg *Config) error {
+	if err := validateConfig(cfg, cfg.ACP); err != nil {
+		return err
+	}
+	if err := cfg.CI.NormalizeInstallations(); err != nil {
+		return err
+	}
+	return normalizeWebConfig(&cfg.Web)
+}
+
+func normalizeWebConfig(web *WebConfig) error {
+	if !web.Enabled {
+		return nil
+	}
+
+	if web.Listen == "" {
+		web.Listen = "127.0.0.1:0"
+	}
+	host, _, err := net.SplitHostPort(web.Listen)
+	if err != nil {
+		return fmt.Errorf("web listen address: %w", err)
+	}
+	loopback := isLoopbackHost(host)
+	if !loopback {
+		return fmt.Errorf("web listener must use a loopback address")
+	}
+
+	if web.BasePath != "" {
+		basePath, err := NormalizeWebBasePath(web.BasePath)
+		if err != nil {
+			return err
+		}
+		web.BasePath = basePath
+	}
+	if web.AuthMode != "" && web.AuthMode != WebAuthModeProxy {
+		return fmt.Errorf("unsupported web auth mode %q", web.AuthMode)
+	}
+	if web.AuthMode == WebAuthModeProxy && (web.AuthToken != "" || web.AuthTokenFile != "") {
+		return fmt.Errorf("web proxy auth mode must not configure auth_token or auth_token_file")
+	}
+	resolvedToken, err := web.ResolveAuthToken()
+	if err != nil {
+		return err
+	}
+
+	if web.AuthMode == WebAuthModeProxy && web.PublicOrigin == "" {
+		return fmt.Errorf("web proxy auth mode requires a public origin")
+	}
+	if web.PublicOrigin != "" {
+		origin, err := normalizeWebOrigin(web.PublicOrigin)
+		if err != nil {
+			return err
+		}
+		web.PublicOrigin = origin
+		parsedOrigin, err := url.Parse(origin)
+		if err != nil {
+			return fmt.Errorf("web public origin: %w", err)
+		}
+		if web.AuthMode == WebAuthModeProxy && parsedOrigin.Scheme != "https" {
+			return fmt.Errorf("web proxy auth mode requires an HTTPS public origin")
+		}
+		if web.AuthMode == "" && !isLoopbackHost(parsedOrigin.Hostname()) && resolvedToken == "" {
+			return fmt.Errorf("web auth token is required for a non-loopback public origin")
+		}
+	}
+	return nil
+}
+
+// ResolveAuthToken validates and returns the effective browser auth token.
+// Tokens configured in a file remain outside the serialized configuration.
+func (web WebConfig) ResolveAuthToken() (string, error) {
+	if web.AuthToken != "" && web.AuthTokenFile != "" {
+		return "", fmt.Errorf("web auth_token and auth_token_file are mutually exclusive")
+	}
+	if web.AuthTokenFile == "" {
+		if web.AuthToken != "" {
+			if err := ValidateWebAuthToken(web.AuthToken); err != nil {
+				return "", err
+			}
+		}
+		return web.AuthToken, nil
+	}
+
+	raw, err := os.ReadFile(web.AuthTokenFile)
+	if err != nil {
+		return "", fmt.Errorf("read web auth token file: %w", err)
+	}
+	if len(raw) > 0 && raw[len(raw)-1] == '\n' {
+		raw = raw[:len(raw)-1]
+		if len(raw) > 0 && raw[len(raw)-1] == '\r' {
+			raw = raw[:len(raw)-1]
+		}
+	}
+	token := string(raw)
+	if strings.IndexFunc(token, unicode.IsSpace) >= 0 {
+		return "", fmt.Errorf("web auth token file must contain a single token")
+	}
+	if err := ValidateWebAuthToken(token); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+// NormalizeWebBasePath validates the canonical external URL path prefix used
+// by the browser application. The empty string means the origin root.
+func NormalizeWebBasePath(raw string) (string, error) {
+	if raw == "" {
+		return "", nil
+	}
+	if strings.TrimSpace(raw) != raw {
+		return "", fmt.Errorf("web base path must not have surrounding whitespace")
+	}
+	if !strings.HasPrefix(raw, "/") {
+		return "", fmt.Errorf("web base path must be an absolute path")
+	}
+	if strings.HasSuffix(raw, "/") {
+		return "", fmt.Errorf("web base path must not have a trailing slash")
+	}
+	if strings.ContainsAny(raw, "?#") {
+		if strings.ContainsRune(raw, '?') {
+			return "", fmt.Errorf("web base path must not contain a query")
+		}
+		return "", fmt.Errorf("web base path must not contain a fragment")
+	}
+	if strings.ContainsRune(raw, '%') {
+		return "", fmt.Errorf("web base path must not contain percent escapes")
+	}
+	if strings.ContainsRune(raw, '\\') {
+		return "", fmt.Errorf("web base path must not contain backslashes")
+	}
+	if strings.IndexFunc(raw, unicode.IsControl) >= 0 {
+		return "", fmt.Errorf("web base path must not contain control characters")
+	}
+	if path.Clean(raw) != raw {
+		return "", fmt.Errorf("web base path must be canonical")
+	}
+	return raw, nil
+}
+
+// ValidateWebAuthToken requires the canonical representation of a 256-bit
+// browser token. Configuration docs direct users to generate these bytes with
+// a cryptographically secure random source rather than choosing a password.
+func ValidateWebAuthToken(token string) error {
+	decoded, err := base64.RawURLEncoding.Strict().DecodeString(token)
+	if err != nil || len(decoded) != 32 || base64.RawURLEncoding.EncodeToString(decoded) != token {
+		return fmt.Errorf("web auth token must be a base64url-encoded 32-byte random value")
+	}
+	return nil
+}
+
+func normalizeWebOrigin(raw string) (string, error) {
+	origin, err := url.Parse(raw)
+	if err != nil || origin.Scheme == "" || origin.Host == "" || origin.User != nil || origin.Path != "" || origin.RawQuery != "" || origin.Fragment != "" {
+		return "", fmt.Errorf("web public origin must be an exact HTTP or HTTPS origin")
+	}
+	scheme := strings.ToLower(origin.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", fmt.Errorf("web public origin must use HTTP or HTTPS")
+	}
+	hostname := strings.ToLower(origin.Hostname())
+	if hostname == "" {
+		return "", fmt.Errorf("web public origin must include a hostname")
+	}
+	if scheme == "http" && !isLoopbackHost(hostname) {
+		return "", fmt.Errorf("web public origin must use HTTPS unless it is loopback")
+	}
+	port := origin.Port()
+	if (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
+		port = ""
+	}
+	authority := hostname
+	if strings.Contains(hostname, ":") {
+		authority = "[" + hostname + "]"
+	}
+	if port != "" {
+		authority = net.JoinHostPort(hostname, port)
+	}
+	return scheme + "://" + authority, nil
+}
+
+func isLoopbackHost(host string) bool {
+	host = strings.Trim(strings.ToLower(host), "[]")
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // HiddenColumnsNoneSentinel is saved to hidden_columns when the
@@ -781,7 +1077,11 @@ func LoadRepoConfig(repoPath string) (*RepoConfig, error) {
 	}
 
 	var cfg RepoConfig
-	if _, err := toml.DecodeFile(path, &cfg); err != nil {
+	md, err := toml.DecodeFile(path, &cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateRepoConfigScope(md); err != nil {
 		return nil, err
 	}
 	if err := validateConfig(&cfg, cfg.ACP); err != nil {
@@ -789,6 +1089,16 @@ func LoadRepoConfig(repoPath string) (*RepoConfig, error) {
 	}
 
 	return &cfg, nil
+}
+
+func validateRepoConfigScope(md toml.MetaData) error {
+	if md.IsDefined("fix_guidelines") {
+		return fmt.Errorf(
+			"repository config key %q is global-only; move it to ~/.roborev/config.toml",
+			"fix_guidelines",
+		)
+	}
+	return nil
 }
 
 func rejectLegacyACPConfig(path string) error {
@@ -902,7 +1212,11 @@ func LoadRepoConfigFromRef(repoPath, ref string) (*RepoConfig, error) {
 	}
 
 	var cfg RepoConfig
-	if _, err := toml.Decode(string(data), &cfg); err != nil {
+	md, err := toml.Decode(string(data), &cfg)
+	if err != nil {
+		return nil, &ConfigParseError{Ref: ref, Err: err}
+	}
+	if err := validateRepoConfigScope(md); err != nil {
 		return nil, &ConfigParseError{Ref: ref, Err: err}
 	}
 	if err := validateConfig(&cfg, cfg.ACP); err != nil {
@@ -1496,7 +1810,7 @@ func SaveGlobal(cfg *Config) error {
 
 // SaveGlobalTo saves the global configuration to a specific path.
 func SaveGlobalTo(path string, cfg *Config) error {
-	if err := validateConfig(cfg, cfg.ACP); err != nil {
+	if err := normalizeGlobalConfig(cfg); err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -1549,7 +1863,7 @@ const defaultHooksExample = `
 // appending a commented [[hooks]] example. It writes atomically (temp file +
 // rename) with 0600 permissions. Use SaveGlobalTo for subsequent rewrites.
 func WriteDefaultGlobalConfigTo(path string, cfg *Config) error {
-	if err := validateConfig(cfg, cfg.ACP); err != nil {
+	if err := normalizeGlobalConfig(cfg); err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

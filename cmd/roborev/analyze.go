@@ -175,7 +175,7 @@ To fix an existing analysis job, use: roborev fix <job_id>
 
 	cmd.Flags().StringVar(&agentName, "agent", "", "agent to use for analysis (default: from config)")
 	cmd.Flags().StringVar(&model, "model", "", "model for analysis agent")
-	cmd.Flags().StringVar(&reasoning, "reasoning", "", "reasoning level: fast, standard, medium, thorough, or maximum")
+	cmd.Flags().StringVar(&reasoning, "reasoning", "", "reasoning level: legacy presets fast, standard, thorough, maximum; exact tiers low, medium, high, xhigh, max")
 	cmd.Flags().BoolVar(&wait, "wait", false, "wait for job to complete and show result")
 	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "suppress output (just enqueue)")
 	cmd.Flags().BoolVar(&listTypes, "list", false, "list available analysis types")
@@ -844,7 +844,11 @@ func runFixAgent(cmd *cobra.Command, repoPath, agentName, model, reasoning, prom
 	if quiet {
 		out = io.Discard
 	} else {
-		fmtr = streamfmt.New(cmd.OutOrStdout(), streamfmt.WriterIsTerminal(cmd.OutOrStdout()))
+		fmtr = streamfmt.New(
+			cmd.OutOrStdout(),
+			streamfmt.WriterIsTerminal(cmd.OutOrStdout()),
+			streamfmt.DecoderForAgent(a.Name()),
+		)
 		out = fmtr
 	}
 
@@ -1036,8 +1040,7 @@ func getBranchFiles(ctx context.Context, cmd *cobra.Command, repoRoot string, op
 		// already-pushed feature commits, contradicting "--branch analyzes
 		// all commits since trunk".
 		upstream, uerr := git.GetUpstream(repoRoot, targetRef)
-		var missing *git.UpstreamMissingError
-		if errors.As(uerr, &missing) {
+		if missing, ok := errors.AsType[*git.UpstreamMissingError](uerr); ok {
 			return nil, fmt.Errorf("%w (or pass --base <ref>)", missing)
 		}
 		if uerr != nil {

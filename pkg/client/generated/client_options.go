@@ -314,6 +314,50 @@ func (o *EnqueueJobRequestOptions) GetHeader() (map[string]string, error) {
 	return nil, nil
 }
 
+// ExportCiCostsRequestOptions is the options needed to make a request to ExportCiCosts.
+type ExportCiCostsRequestOptions struct {
+	Query *ExportCiCostsQuery
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *ExportCiCostsRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.Query != nil {
+		if v, ok := any(o.Query).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Query", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *ExportCiCostsRequestOptions) GetPathParams() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *ExportCiCostsRequestOptions) GetQuery() (map[string]any, error) {
+	return runtime.AsMap[any](o.Query)
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *ExportCiCostsRequestOptions) GetBody() any {
+	return nil
+}
+
+// GetHeader returns the headers as a map.
+func (o *ExportCiCostsRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
 // ExportCiMetricsRequestOptions is the options needed to make a request to ExportCiMetrics.
 type ExportCiMetricsRequestOptions struct {
 	Query *ExportCiMetricsQuery
@@ -536,7 +580,8 @@ func (o *CreateFixJobRequestOptions) GetHeader() (map[string]string, error) {
 
 // GetJobLogRequestOptions is the options needed to make a request to GetJobLog.
 type GetJobLogRequestOptions struct {
-	Query *GetJobLogQuery
+	Query  *GetJobLogQuery
+	Header *GetJobLogHeaders
 }
 
 // Validate validates all the fields in the options.
@@ -548,6 +593,14 @@ func (o *GetJobLogRequestOptions) Validate() error {
 		if v, ok := any(o.Query).(runtime.Validator); ok {
 			if err := v.Validate(); err != nil {
 				errors = errors.Append("Query", err)
+			}
+		}
+	}
+
+	if o.Header != nil {
+		if v, ok := any(o.Header).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Header", err)
 			}
 		}
 	}
@@ -575,7 +628,7 @@ func (o *GetJobLogRequestOptions) GetBody() any {
 
 // GetHeader returns the headers as a map.
 func (o *GetJobLogRequestOptions) GetHeader() (map[string]string, error) {
-	return nil, nil
+	return runtime.AsMap[string](o.Header)
 }
 
 // GetJobOutputRequestOptions is the options needed to make a request to GetJobOutput.
@@ -1323,5 +1376,313 @@ func (o *BackfillTokensRequestOptions) GetBody() any {
 
 // GetHeader returns the headers as a map.
 func (o *BackfillTokensRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// GetWebAnalyticsRequestOptions is the options needed to make a request to GetWebAnalytics.
+type GetWebAnalyticsRequestOptions struct {
+	Query *GetWebAnalyticsQuery
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *GetWebAnalyticsRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.Query != nil {
+		if v, ok := any(o.Query).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Query", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *GetWebAnalyticsRequestOptions) GetPathParams() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *GetWebAnalyticsRequestOptions) GetQuery() (map[string]any, error) {
+	return runtime.AsMap[any](o.Query)
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *GetWebAnalyticsRequestOptions) GetBody() any {
+	return nil
+}
+
+// GetHeader returns the headers as a map.
+func (o *GetWebAnalyticsRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// GetReviewProjectionRequestOptions is the options needed to make a request to GetReviewProjection.
+type GetReviewProjectionRequestOptions struct {
+	Query *GetReviewProjectionQuery
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *GetReviewProjectionRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.Query != nil {
+		if v, ok := any(o.Query).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Query", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *GetReviewProjectionRequestOptions) GetPathParams() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *GetReviewProjectionRequestOptions) GetQuery() (map[string]any, error) {
+	return runtime.AsMap[any](o.Query)
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *GetReviewProjectionRequestOptions) GetBody() any {
+	return nil
+}
+
+// GetHeader returns the headers as a map.
+func (o *GetReviewProjectionRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// BootstrapWebSessionRequestOptions is the options needed to make a request to BootstrapWebSession.
+type BootstrapWebSessionRequestOptions struct {
+	Body *BootstrapWebSessionBody
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *BootstrapWebSessionRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.Body != nil {
+		if v, ok := any(o.Body).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Body", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *BootstrapWebSessionRequestOptions) GetPathParams() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *BootstrapWebSessionRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *BootstrapWebSessionRequestOptions) GetBody() any {
+	return o.Body
+}
+
+// GetHeader returns the headers as a map.
+func (o *BootstrapWebSessionRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// LoginWebSessionRequestOptions is the options needed to make a request to LoginWebSession.
+type LoginWebSessionRequestOptions struct {
+	Body *LoginWebSessionBody
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *LoginWebSessionRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.Body != nil {
+		if v, ok := any(o.Body).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Body", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *LoginWebSessionRequestOptions) GetPathParams() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *LoginWebSessionRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *LoginWebSessionRequestOptions) GetBody() any {
+	return o.Body
+}
+
+// GetHeader returns the headers as a map.
+func (o *LoginWebSessionRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// PrepareUpdateRequestOptions is the options needed to make a request to PrepareUpdate.
+type PrepareUpdateRequestOptions struct {
+	Body *PrepareUpdateBody
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *PrepareUpdateRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.Body != nil {
+		if v, ok := any(o.Body).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Body", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *PrepareUpdateRequestOptions) GetPathParams() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *PrepareUpdateRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *PrepareUpdateRequestOptions) GetBody() any {
+	return o.Body
+}
+
+// GetHeader returns the headers as a map.
+func (o *PrepareUpdateRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// ReleaseUpdateRequestOptions is the options needed to make a request to ReleaseUpdate.
+type ReleaseUpdateRequestOptions struct {
+	Body *ReleaseUpdateBody
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *ReleaseUpdateRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.Body != nil {
+		if v, ok := any(o.Body).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Body", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *ReleaseUpdateRequestOptions) GetPathParams() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *ReleaseUpdateRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *ReleaseUpdateRequestOptions) GetBody() any {
+	return o.Body
+}
+
+// GetHeader returns the headers as a map.
+func (o *ReleaseUpdateRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// RenewUpdateRequestOptions is the options needed to make a request to RenewUpdate.
+type RenewUpdateRequestOptions struct {
+	Body *RenewUpdateBody
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *RenewUpdateRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.Body != nil {
+		if v, ok := any(o.Body).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Body", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *RenewUpdateRequestOptions) GetPathParams() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *RenewUpdateRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *RenewUpdateRequestOptions) GetBody() any {
+	return o.Body
+}
+
+// GetHeader returns the headers as a map.
+func (o *RenewUpdateRequestOptions) GetHeader() (map[string]string, error) {
 	return nil, nil
 }

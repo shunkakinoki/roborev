@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -312,6 +313,74 @@ func TestHandleCancelJob(t *testing.T) {
 	}
 }
 
+func TestRunningJobCancellationBroadcastsOnce(t *testing.T) {
+	server, db, tempDir := newTestServer(t)
+	testutil.InitTestGitRepo(t, tempDir)
+	markerFile := filepath.Join(tempDir, "local-running-cancel-hook")
+	server.configWatcher.Config().Hooks = []config.HookConfig{{
+		Event: "review.canceled", Command: touchCmd(markerFile),
+	}}
+
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	const agentName = "local-cancel-blocking"
+	agent.Register(&agent.FakeAgent{
+		NameStr: agentName,
+		ReviewFn: func(ctx context.Context, _, _, _ string, _ io.Writer) (string, error) {
+			close(started)
+			<-ctx.Done()
+			return "", ctx.Err()
+		},
+	})
+	t.Cleanup(func() { agent.Unregister(agentName) })
+
+	job := createTestJob(
+		t, db, tempDir, testutil.GetHeadSHA(t, tempDir), agentName,
+	)
+	claimed, err := db.ClaimJob("local-cancel-worker")
+	require.NoError(t, err)
+	require.Equal(t, job.ID, claimed.ID)
+	go func() {
+		defer close(finished)
+		server.workerPool.processJob("local-cancel-worker", claimed)
+	}()
+	t.Cleanup(func() {
+		server.workerPool.CancelJob(job.ID)
+		<-finished
+	})
+	require.Eventually(t, func() bool {
+		select {
+		case <-started:
+			return true
+		default:
+			return false
+		}
+	}, 5*time.Second, 10*time.Millisecond)
+
+	_, eventCh := server.broadcaster.Subscribe("")
+	req := testutil.MakeJSONRequest(
+		t, http.MethodPost, "/api/job/cancel", CancelJobRequest{JobID: job.ID},
+	)
+	recorder := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(recorder, req)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Eventually(t, func() bool {
+		select {
+		case <-finished:
+			return true
+		default:
+			return false
+		}
+	}, 5*time.Second, 10*time.Millisecond)
+	server.hookRunner.WaitUntilIdle()
+	assert.FileExists(t, markerFile)
+	require.Len(t, eventCh, 1)
+	event := <-eventCh
+	assert.Equal(t, "review.canceled", event.Type)
+	assert.Equal(t, job.ID, event.JobID)
+}
+
 func TestHandleRerunJob(t *testing.T) {
 	server, db, tmpDir := newTestServer(t)
 
@@ -353,6 +422,32 @@ func TestHandleRerunJob(t *testing.T) {
 		}
 	})
 
+	t.Run("rerun request is idempotent", func(t *testing.T) {
+		commit, err := db.GetOrCreateCommit(repo.ID, "rerun-idempotent", "Author", "Subject", time.Now())
+		require.NoError(t, err)
+		job, err := db.EnqueueJob(storage.EnqueueOpts{
+			RepoID: repo.ID, CommitID: commit.ID, GitRef: "rerun-idempotent", Agent: "test",
+		})
+		require.NoError(t, err)
+		require.NoError(t, db.CancelJob(job.ID))
+
+		body := RerunJobRequest{JobID: job.ID, RequestID: "request-one"}
+		var responses []RerunJobOutput
+		for range 2 {
+			req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/job/rerun", body)
+			w := httptest.NewRecorder()
+			server.httpServer.Handler.ServeHTTP(w, req)
+			testutil.AssertStatusCode(t, w, http.StatusOK)
+			var response RerunJobOutput
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response.Body))
+			responses = append(responses, response)
+		}
+
+		assert.Equal(t, responses[0].Body, responses[1].Body)
+		assert.Equal(t, job.ID, responses[0].Body.JobID)
+		assert.Equal(t, "request-one", responses[0].Body.RequestID)
+	})
+
 	t.Run("rerun canceled job", func(t *testing.T) {
 		commit, _ := db.GetOrCreateCommit(repo.ID, "rerun-canceled", "Author", "Subject", time.Now())
 		job, _ := db.EnqueueJob(storage.EnqueueOpts{RepoID: repo.ID, CommitID: commit.ID, GitRef: "rerun-canceled", Agent: "test"})
@@ -380,6 +475,35 @@ func TestHandleRerunJob(t *testing.T) {
 				return false
 			}, "Expected status 'queued', got '%s'", updated.Status)
 		}
+	})
+
+	t.Run("rerun canceled job waits for worker teardown", func(t *testing.T) {
+		isolatedDB, isolatedDir := testutil.OpenTestDBWithDir(t)
+		isolatedServer := NewServer(isolatedDB, config.DefaultConfig(), "")
+		t.Cleanup(func() { require.NoError(t, isolatedServer.Close()) })
+		repo, err := isolatedDB.GetOrCreateRepo(isolatedDir)
+		require.NoError(t, err)
+		commit, err := isolatedDB.GetOrCreateCommit(
+			repo.ID, "rerun-canceled-running", "Author", "Subject", time.Now(),
+		)
+		require.NoError(t, err)
+		job, err := isolatedDB.EnqueueJob(storage.EnqueueOpts{
+			RepoID: repo.ID, CommitID: commit.ID, GitRef: "rerun-canceled-running", Agent: "test",
+		})
+		require.NoError(t, err)
+		claimed, err := isolatedDB.ClaimJob("worker-canceled-running")
+		require.NoError(t, err)
+		require.Equal(t, job.ID, claimed.ID)
+		require.NoError(t, isolatedDB.CancelJob(job.ID))
+
+		req := testutil.MakeJSONRequest(
+			t, http.MethodPost, "/api/job/rerun", RerunJobRequest{JobID: job.ID},
+		)
+		w := httptest.NewRecorder()
+		isolatedServer.httpServer.Handler.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusConflict, w.Code)
+		assert.Contains(t, w.Body.String(), "still stopping")
 	})
 
 	t.Run("rerun done job", func(t *testing.T) {
@@ -556,6 +680,45 @@ func TestHandleRerunJob(t *testing.T) {
 			}, "Expected status 405 for GET, got %d", w.Code)
 		}
 	})
+}
+
+func TestRerunJobBroadcastsOnlyAcceptedRequest(t *testing.T) {
+	server, db, tempDir := newTestServer(t)
+	repo, err := db.GetOrCreateRepo(tempDir)
+	require.NoError(t, err)
+	commit, err := db.GetOrCreateCommit(
+		repo.ID, "rerun-broadcast", "Author", "Subject", time.Now(),
+	)
+	require.NoError(t, err)
+	job, err := db.EnqueueJob(storage.EnqueueOpts{
+		RepoID: repo.ID, CommitID: commit.ID,
+		GitRef: "rerun-broadcast", Agent: "test",
+	})
+	require.NoError(t, err)
+	require.NoError(t, db.CancelJob(job.ID))
+
+	subscriberID, events := server.broadcaster.Subscribe("")
+	defer server.broadcaster.Unsubscribe(subscriberID)
+	body := RerunJobRequest{JobID: job.ID, RequestID: "rerun-broadcast-request"}
+
+	first := testutil.MakeJSONRequest(t, http.MethodPost, "/api/job/rerun", body)
+	firstResponse := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(firstResponse, first)
+	require.Equal(t, http.StatusOK, firstResponse.Code, firstResponse.Body.String())
+	require.Len(t, events, 1)
+	event := <-events
+	assert.Equal(t, "job.enqueued", event.Type)
+	assert.Equal(t, job.ID, event.JobID)
+	assert.Equal(t, repo.RootPath, event.Repo)
+	assert.Equal(t, repo.Name, event.RepoName)
+	assert.Equal(t, job.GitRef, event.SHA)
+	assert.Equal(t, job.Agent, event.Agent)
+
+	replay := testutil.MakeJSONRequest(t, http.MethodPost, "/api/job/rerun", body)
+	replayResponse := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(replayResponse, replay)
+	require.Equal(t, http.StatusOK, replayResponse.Code, replayResponse.Body.String())
+	assert.Empty(t, events, "idempotent replay must not broadcast again")
 }
 
 func TestWorkflowForJobFixType(t *testing.T) {
@@ -916,6 +1079,59 @@ func TestHandleAddCommentWithoutReview(t *testing.T) {
 			return false
 		}, "Unexpected comment: %q", comments[0].Response)
 	}
+}
+
+func TestHandleAddCommentBroadcastsEvent(t *testing.T) {
+	t.Run("job comment", func(t *testing.T) {
+		server, db, tmpDir := newTestServer(t)
+		job := createTestJob(t, db, filepath.Join(tmpDir, "test-repo"), "abc123", "test")
+		_, eventCh := server.broadcaster.Subscribe("")
+
+		req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/comment", AddCommentRequest{
+			JobID: job.ID, Commenter: "reviewer", Comment: "Looks good",
+		})
+		w := httptest.NewRecorder()
+		server.httpServer.Handler.ServeHTTP(w, req)
+		require.Equal(t, http.StatusCreated, w.Code)
+
+		select {
+		case event := <-eventCh:
+			assert.Equal(t, "review.commented", event.Type)
+			assert.Equal(t, job.ID, event.JobID)
+			assert.Equal(t, "abc123", event.SHA)
+			assert.NotEmpty(t, event.Repo)
+			assert.NotEmpty(t, event.RepoName)
+		case <-time.After(time.Second):
+			require.FailNow(t, "timed out waiting for review.commented event")
+		}
+	})
+
+	t.Run("commit comment", func(t *testing.T) {
+		server, db, tmpDir := newTestServer(t)
+		repo, err := db.GetOrCreateRepo(filepath.Join(tmpDir, "test-repo"))
+		require.NoError(t, err)
+		_, err = db.GetOrCreateCommit(repo.ID, "def456", "Author", "Subject", time.Now())
+		require.NoError(t, err)
+		_, eventCh := server.broadcaster.Subscribe("")
+
+		req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/comment", AddCommentRequest{
+			SHA: "def456", Commenter: "reviewer", Comment: "Commit context",
+		})
+		w := httptest.NewRecorder()
+		server.httpServer.Handler.ServeHTTP(w, req)
+		require.Equal(t, http.StatusCreated, w.Code)
+
+		select {
+		case event := <-eventCh:
+			assert.Equal(t, "review.commented", event.Type)
+			assert.Zero(t, event.JobID)
+			assert.Equal(t, "def456", event.SHA)
+			assert.Equal(t, repo.RootPath, event.Repo)
+			assert.Equal(t, repo.Name, event.RepoName)
+		case <-time.After(time.Second):
+			require.FailNow(t, "timed out waiting for review.commented event")
+		}
+	})
 }
 
 func TestHandleCloseReview_BroadcastsEvent(t *testing.T) {

@@ -1035,6 +1035,18 @@ func isFullObjectID(ref string) bool {
 
 // GetRepoRoot returns the root directory of the git repository
 func GetRepoRoot(path string) (string, error) {
+	// A linked worktree has a .git file that names its worktree-specific
+	// administrative directory. Prefer that local binding over
+	// --show-toplevel: a shared core.worktree setting can make Git report a
+	// sibling checkout even while HEAD and --git-dir still belong to the
+	// worktree containing path.
+	if root, found, err := linkedWorktreeRoot(path); found {
+		if err != nil {
+			return "", err
+		}
+		return root, nil
+	}
+
 	cmd := newGitCmd("rev-parse", "--show-toplevel")
 	cmd.Dir = path
 
@@ -1046,6 +1058,54 @@ func GetRepoRoot(path string) (string, error) {
 	// Git on Windows can return MSYS-style paths (/c/Users/...) or forward-slash paths (C:/...).
 	// Convert to native Windows paths for consistency with Go's filepath.
 	return normalizeMSYSPath(string(out)), nil
+}
+
+func linkedWorktreeRoot(path string) (string, bool, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", false, nil
+	}
+	if info, statErr := os.Stat(abs); statErr == nil && !info.IsDir() {
+		abs = filepath.Dir(abs)
+	}
+
+	for dir := abs; ; dir = filepath.Dir(dir) {
+		marker := filepath.Join(dir, ".git")
+		info, err := os.Lstat(marker)
+		if err == nil && info.Mode().IsRegular() {
+			data, readErr := os.ReadFile(marker)
+			if readErr != nil {
+				return "", true, fmt.Errorf("read linked worktree marker: %w", readErr)
+			}
+			gitDir, found := strings.CutPrefix(strings.TrimSpace(string(data)), "gitdir:")
+			if !found {
+				return "", true, fmt.Errorf("invalid linked worktree marker %s", marker)
+			}
+			gitDir = strings.TrimSpace(gitDir)
+			if !filepath.IsAbs(gitDir) {
+				gitDir = filepath.Join(dir, gitDir)
+			}
+
+			resolved, resolveErr := ResolveGitDir(path)
+			if resolveErr != nil {
+				return "", true, resolveErr
+			}
+			if cleanEvalPath(gitDir) != cleanEvalPath(resolved) {
+				return "", true, fmt.Errorf("linked worktree marker does not match git directory")
+			}
+			return cleanEvalPath(dir), true, nil
+		}
+		if err == nil {
+			return "", false, nil
+		}
+		if !os.IsNotExist(err) {
+			return "", true, fmt.Errorf("inspect git marker: %w", err)
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", false, nil
+		}
+	}
 }
 
 // ValidateWorktreeForRepo checks that worktreePath is a git checkout
@@ -2317,6 +2377,43 @@ func GetMergeBase(repoPath, ref1, ref2 string) (string, error) {
 	}
 
 	return strings.TrimSpace(string(out)), nil
+}
+
+// CommitCount returns the number of commits reachable from rev.
+func CommitCount(repoPath, rev string) (int, error) {
+	cmd := newGitCmd("rev-list", "--count", rev)
+	cmd.Dir = repoPath
+
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, fmt.Errorf("git rev-list --count %s: %w", rev, err)
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0, fmt.Errorf("parse rev-list count %q: %w", out, err)
+	}
+	return count, nil
+}
+
+// IsRootCommit reports whether rev's commit object records no parents. It
+// reads the raw object rather than walking history: a shallow clone grafts
+// away the boundary commit's parents, so rev-list-based checks see a parentless
+// commit there, while the raw object still names its parents.
+func IsRootCommit(repoPath, rev string) (bool, error) {
+	cmd := newGitCmd("cat-file", "commit", rev)
+	cmd.Dir = repoPath
+
+	out, err := cmd.Output()
+	if err != nil {
+		return false, fmt.Errorf("git cat-file commit %s: %w", rev, err)
+	}
+	header, _, _ := strings.Cut(string(out), "\n\n")
+	for line := range strings.SplitSeq(header, "\n") {
+		if strings.HasPrefix(line, "parent ") {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // GetCommitsSince returns all commits from mergeBase to HEAD (exclusive of mergeBase)

@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -68,6 +69,8 @@ func newWorkerTestContext(t *testing.T, workers int) *workerTestContext {
 	b := NewBroadcaster()
 	pool := NewWorkerPool(db, NewStaticConfig(cfg), cfg.MaxWorkers, b, nil, nil)
 	pool.retryBackoff = 0 // keep retry-driven tests fast
+	pool.tokenUsageIndexRetryWindow = 20 * time.Millisecond
+	pool.tokenUsageIndexRetryInterval = time.Millisecond
 
 	return &workerTestContext{
 		DB:          db,
@@ -174,6 +177,30 @@ func (c *workerTestContext) reconfigurePool(cfg *config.Config) {
 	c.Pool.retryBackoff = 0
 }
 
+func requireOutputChannelClosed(t *testing.T, ch <-chan OutputLine) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		select {
+		case _, ok := <-ch:
+			return !ok
+		default:
+			return false
+		}
+	}, time.Second, time.Millisecond, "job output channel remained open")
+}
+
+func TestSubscribeJobOutputClosesLateTerminalSubscription(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+	job := tc.createJob(t, "terminal-output")
+	setJobStatus(t, tc.DB, job.ID, storage.JobStatusDone)
+
+	_, ch, cancel := tc.Pool.SubscribeJobOutput(job.ID)
+	defer cancel()
+
+	requireOutputChannelClosed(t, ch)
+	assert.False(t, tc.Pool.HasJobOutput(job.ID))
+}
+
 func TestWorkerPoolConcurrency(t *testing.T) {
 	t.Parallel()
 	tc := newWorkerTestContext(t, 4)
@@ -266,6 +293,54 @@ func TestWorkerPoolPendingCancellationAfterDBCancel(t *testing.T) {
 			return false
 		}, "Job should have been canceled immediately on registration")
 	}
+}
+
+func TestCanceledJobCannotRerunUntilBlockedAgentExits(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+	started := make(chan struct{})
+	cancelObserved := make(chan struct{})
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAgent := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(func() {
+		releaseAgent()
+		<-finished
+	})
+
+	agentName := "blocked-cancel-rerun"
+	agent.Register(&agent.FakeAgent{
+		NameStr: agentName,
+		ReviewFn: func(ctx context.Context, _, _, _ string, _ io.Writer) (string, error) {
+			close(started)
+			<-ctx.Done()
+			close(cancelObserved)
+			<-release
+			return "", ctx.Err()
+		},
+	})
+	t.Cleanup(func() { agent.Unregister(agentName) })
+
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agentName)
+	go func() {
+		defer close(finished)
+		tc.Pool.processJob(testWorkerID, job)
+	}()
+
+	<-started
+	require.NoError(t, tc.DB.CancelJob(job.ID))
+	require.True(t, tc.Pool.CancelJob(job.ID))
+	<-cancelObserved
+
+	require.ErrorIs(t, tc.DB.ReenqueueJob(job.ID, storage.ReenqueueOpts{}), sql.ErrNoRows)
+
+	releaseAgent()
+	<-finished
+	updated, err := tc.DB.GetJobByID(job.ID)
+	require.NoError(t, err)
+	assert.Empty(t, updated.WorkerID)
+	require.NoError(t, tc.DB.ReenqueueJob(job.ID, storage.ReenqueueOpts{}))
 }
 
 func TestWorkerPoolCancelInvalidJob(t *testing.T) {
@@ -371,7 +446,7 @@ func TestWorkerCIPanelMemberRunsAgainstReviewedHeadWorktree(t *testing.T) {
 	staleHead := repo.HeadSHA()
 	baseSHA := repo.CommitFile("README.md", "base\n", "base")
 	repo.CommitFile("go.mod", "module go.kenn.io/middleman\n", "module migration")
-	headSHA := repo.CommitFile("internal/testenv/githubguard/githubguard.go", "package githubguard\n", "guard")
+	headSHA := repo.CommitFile("internal/testenv/forgeguard/forgeguard.go", "package forgeguard\n", "guard")
 	repo.Checkout("--detach", staleHead)
 
 	storedRepo, err := db.GetOrCreateRepo(repo.Path(), "https://github.com/kenn-io/middleman.git")
@@ -919,6 +994,170 @@ func TestCaptureTokenUsageForSessionUsesCodexJobLog(t *testing.T) {
 	assert.Equal(t, "thread-123", usage.ThreadID)
 }
 
+func TestCaptureTokenUsageForSessionRejectsReenqueuedJob(t *testing.T) {
+	t.Setenv("ROBOREV_DATA_DIR", t.TempDir())
+	tc := newWorkerTestContext(t, 1)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, "codex")
+	require.NoError(t, tc.DB.CompleteJob(
+		job.ID, "codex", "prompt", "No issues found.",
+	))
+
+	tc.Pool.tokenUsageFetcher = func(context.Context, string) (*tokens.Usage, error) {
+		_, err := tc.DB.Exec(`
+			UPDATE review_jobs
+			SET status = 'done', started_at = '2026-08-20T16:00:00.987654321Z',
+			    finished_at = '2026-08-20T16:00:02Z', session_id = NULL,
+			    token_usage = NULL
+			WHERE id = ?`, job.ID)
+		require.NoError(t, err)
+		return &tokens.Usage{
+			OutputTokens: 32, ThreadID: "prior-session", HasCost: true, CostUSD: 0.2,
+		}, nil
+	}
+
+	tc.Pool.captureTokenUsageForSession(
+		context.Background(), testWorkerID, job, "prior-session",
+	)
+
+	updated, err := tc.DB.GetJobByID(job.ID)
+	require.NoError(t, err)
+	assert.Empty(t, updated.SessionID)
+	assert.Empty(t, updated.TokenUsage)
+}
+
+func TestCaptureTokenUsageForSessionKeepsJobLogWhenSessionIsReused(t *testing.T) {
+	t.Setenv("ROBOREV_DATA_DIR", t.TempDir())
+	tc := newWorkerTestContext(t, 1)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, "codex")
+	require.NoError(t, tc.DB.CompleteJob(job.ID, "codex", "prompt", "No issues found."))
+
+	logPath := JobLogPath(job.ID)
+	require.NoError(t, os.MkdirAll(filepath.Dir(logPath), 0o700))
+	require.NoError(t, os.WriteFile(logPath, []byte(
+		`{"type":"thread.started","thread_id":"shared-session"}`+"\n"+
+			`{"type":"turn.completed","usage":{"input_tokens":79150,`+
+			`"cached_input_tokens":2560,"output_tokens":3389}}`+"\n",
+	), 0o600))
+
+	reused := tc.createAndClaimJobWithAgent(t, "other-ref", "worker-reuse", "codex")
+	require.NoError(t, tc.DB.SaveJobSessionID(
+		reused.ID, "worker-reuse", "shared-session",
+	))
+	tc.Pool.tokenUsageFetcher = func(context.Context, string) (*tokens.Usage, error) {
+		return &tokens.Usage{CostUSD: 0.42, HasCost: true}, nil
+	}
+
+	tc.Pool.captureTokenUsageForSession(
+		context.Background(), testWorkerID, job, "shared-session",
+	)
+
+	updated, err := tc.DB.GetJobByID(job.ID)
+	require.NoError(t, err)
+	usage := tokens.ParseJSON(updated.TokenUsage)
+	require.NotNil(t, usage)
+	assert.Equal(t, int64(79150), usage.InputTokens)
+	assert.Equal(t, int64(2560), usage.CachedInputTokens)
+	assert.Equal(t, int64(3389), usage.OutputTokens)
+	assert.False(t, usage.HasCost)
+}
+
+func TestCaptureTokenUsageForSessionRetriesUntilFreshSessionIsIndexed(t *testing.T) {
+	t.Setenv("ROBOREV_DATA_DIR", t.TempDir())
+	tc := newWorkerTestContext(t, 1)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, "codex")
+	require.NoError(t, tc.DB.CompleteJob(job.ID, "codex", "prompt", "No issues found."))
+
+	var attempts atomic.Int32
+	tc.Pool.tokenUsageFetcher = func(context.Context, string) (*tokens.Usage, error) {
+		if attempts.Add(1) < 3 {
+			return nil, nil
+		}
+		return &tokens.Usage{
+			OutputTokens: 481,
+			CostUSD:      0.17,
+			HasCost:      true,
+		}, nil
+	}
+
+	tc.Pool.captureTokenUsageForSession(
+		context.Background(), testWorkerID, job, "fresh-session-123",
+	)
+
+	updated, err := tc.DB.GetJobByID(job.ID)
+	require.NoError(t, err)
+	usage := tokens.ParseJSON(updated.TokenUsage)
+	require.NotNil(t, usage)
+	assert.Equal(t, int32(3), attempts.Load())
+	assert.Equal(t, int64(481), usage.OutputTokens)
+	assert.True(t, usage.HasCost)
+	assert.InDelta(t, 0.17, usage.CostUSD, 1e-9)
+}
+
+func TestCaptureTokenUsageForSessionDoesNotRetryUnavailableProvider(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("PATH handling differs on Windows")
+	}
+
+	t.Setenv("ROBOREV_DATA_DIR", t.TempDir())
+	tc := newWorkerTestContext(t, 1)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, "codex")
+	require.NoError(t, tc.DB.CompleteJob(job.ID, "codex", "prompt", "No issues found."))
+
+	tc.Pool.tokenUsageIndexRetryWindow = 400 * time.Millisecond
+	tc.Pool.tokenUsageIndexRetryInterval = 200 * time.Millisecond
+	t.Setenv("PATH", t.TempDir())
+
+	started := time.Now()
+	tc.Pool.captureTokenUsageForSession(
+		context.Background(), testWorkerID, job, "fresh-session-789",
+	)
+
+	assert.Less(t, time.Since(started), 100*time.Millisecond)
+}
+
+func TestCaptureTokenUsageForSessionStopsRetryingAtContextDeadline(t *testing.T) {
+	t.Setenv("ROBOREV_DATA_DIR", t.TempDir())
+	tc := newWorkerTestContext(t, 1)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, "codex")
+	require.NoError(t, tc.DB.CompleteJob(job.ID, "codex", "prompt", "No issues found."))
+
+	logPath := JobLogPath(job.ID)
+	require.NoError(t, os.MkdirAll(filepath.Dir(logPath), 0o700))
+	require.NoError(t, os.WriteFile(logPath, []byte(
+		`{"type":"thread.started","thread_id":"fresh-session-456"}`+"\n"+
+			`{"type":"turn.completed","usage":{"input_tokens":1024,`+
+			`"output_tokens":64}}`+"\n",
+	), 0o600))
+
+	var attempts atomic.Int32
+	tc.Pool.tokenUsageFetcher = func(context.Context, string) (*tokens.Usage, error) {
+		attempts.Add(1)
+		return nil, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	tc.Pool.captureTokenUsageForSession(
+		ctx, testWorkerID, job, "fresh-session-456",
+	)
+
+	updated, err := tc.DB.GetJobByID(job.ID)
+	require.NoError(t, err)
+	usage := tokens.ParseJSON(updated.TokenUsage)
+	require.NotNil(t, usage)
+	assert.GreaterOrEqual(t, attempts.Load(), int32(2))
+	assert.Less(t, time.Since(started), 250*time.Millisecond)
+	assert.Equal(t, int64(1024), usage.InputTokens)
+	assert.Equal(t, int64(64), usage.OutputTokens)
+	assert.False(t, usage.HasCost)
+}
+
 func TestProcessJob_UsesStoredReviewPromptOverride(t *testing.T) {
 	tc := newWorkerTestContext(t, 1)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
@@ -1119,6 +1358,7 @@ func TestProcessJob_PromotedAutoDesignAppendsExistingClassifierLog(t *testing.T)
 	require.NoError(t, err)
 	require.NoError(t, os.MkdirAll(JobLogDir(), 0o700))
 	require.NoError(t, os.WriteFile(JobLogPath(jobID), []byte("classifier progress\n"), 0o600))
+	require.NoError(t, markJobLogForAppend(jobID))
 
 	claimed, err := tc.DB.ClaimJob("worker-promoted-log")
 	require.NoError(t, err)
@@ -1129,6 +1369,28 @@ func TestProcessJob_PromotedAutoDesignAppendsExistingClassifierLog(t *testing.T)
 	require.NoError(t, err)
 	assert.Contains(t, string(data), "classifier progress")
 	assert.Contains(t, string(data), "design review progress")
+}
+
+func TestProcessJob_RerunClearsLogBeforeSetupFailure(t *testing.T) {
+	setupTestEnv(t)
+	tc := newWorkerTestContext(t, 1)
+
+	job := tc.createAndClaimJob(t, "missing-ref", "worker-old-attempt")
+	failed, err := tc.DB.FailJob(job.ID, "worker-old-attempt", "old attempt failed")
+	require.NoError(t, err)
+	require.True(t, failed)
+	require.NoError(t, os.MkdirAll(JobLogDir(), 0o700))
+	require.NoError(t, os.WriteFile(JobLogPath(job.ID), []byte("old attempt output\n"), 0o600))
+	require.NoError(t, tc.DB.ReenqueueJob(job.ID, storage.ReenqueueOpts{}))
+
+	rerun, err := tc.DB.ClaimJob("worker-new-attempt")
+	require.NoError(t, err)
+	require.Equal(t, job.ID, rerun.ID)
+	tc.Pool.processJob("worker-new-attempt", rerun)
+
+	data, err := os.ReadFile(JobLogPath(job.ID))
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), "old attempt output")
 }
 
 func TestProcessJob_RetriedAutoDesignTruncatesPreviousReviewLog(t *testing.T) {
@@ -1193,25 +1455,6 @@ func TestProcessJob_RetriedAutoDesignTruncatesPreviousReviewLog(t *testing.T) {
 	assert.NotContains(t, logText, "classifier progress")
 	assert.NotContains(t, logText, "stale failed review")
 	assert.Contains(t, logText, "retry review progress")
-}
-
-func TestShouldAppendReviewJobLogForAutoDesignWithoutExistingLog(t *testing.T) {
-	setupTestEnv(t)
-	job := &storage.ReviewJob{ID: 909, Source: "auto_design"}
-
-	assert.False(t, JobLogExists(job.ID))
-	assert.True(t, shouldAppendReviewJobLog(job))
-	assert.False(t, shouldAppendReviewJobLog(&storage.ReviewJob{ID: 910}))
-}
-
-func TestShouldAppendReviewJobLogOnlyForFirstAutoDesignAttempt(t *testing.T) {
-	job := &storage.ReviewJob{
-		ID:         909,
-		Source:     "auto_design",
-		RetryCount: 1,
-	}
-
-	assert.False(t, shouldAppendReviewJobLog(job))
 }
 
 func TestApplyCodexReviewSettings(t *testing.T) {
@@ -1685,13 +1928,59 @@ func TestProcessJob_OversizedFinalPromptFailsBeforeAnyAgent(t *testing.T) {
 	claimed, err := tc.DB.ClaimJob(testWorkerID)
 	require.NoError(t, err)
 	require.Equal(t, job.ID, claimed.ID)
+	_, output, cancelOutput := tc.Pool.SubscribeJobOutput(job.ID)
+	defer cancelOutput()
 
 	tc.Pool.processJob(testWorkerID, claimed)
 
+	requireOutputChannelClosed(t, output)
 	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
 	assert.False(t, agentCalled, "oversized final prompt must not be submitted")
 	assert.Equal(t, 0, updated.RetryCount)
 	assert.Contains(t, updated.Error, "prompt exceeds size limit before agent submission")
+}
+
+func TestProcessJob_NonzeroAgentExitFailsPromptly(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("synthetic agent uses a POSIX shell")
+	}
+	assert := assert.New(t)
+
+	commandPath := filepath.Join(t.TempDir(), "codex")
+	require.NoError(t, os.WriteFile(commandPath, []byte(`#!/bin/sh
+case "$1" in *etxtbsy*) exit 0;; esac
+case "$*" in *--help*) echo "usage --sandbox"; exit 0;; esac
+(sleep 3 2>/dev/null) &
+echo '{"type":"thread.started","thread_id":"synthetic"}'
+echo 'synthetic agent failure' >&2
+exit 17
+`), 0o755))
+
+	tc := newWorkerTestContext(t, 1)
+	cfg := config.DefaultConfig()
+	cfg.CodexCmd = commandPath
+	tc.reconfigurePool(cfg)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, "codex")
+	job = tc.exhaustRetries(t, job, testWorkerID, "codex")
+	_, eventCh := tc.Broadcaster.Subscribe("")
+
+	startedAt := time.Now()
+	tc.Pool.processJob(testWorkerID, job)
+	elapsed := time.Since(startedAt)
+
+	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
+	assert.Less(elapsed, 1500*time.Millisecond,
+		"job waited for a descendant-held stdout pipe after the agent exited")
+	assert.Contains(updated.Error, "exit status 17")
+	assert.NotContains(updated.Error, agentTimeoutErrorPrefix)
+
+	startedEvent, ok := waitForEvent(t, eventCh, time.Second)
+	require.True(t, ok, "expected review.started event")
+	assert.Equal("review.started", startedEvent.Type)
+	failedEvent, ok := waitForEvent(t, eventCh, time.Second)
+	require.True(t, ok, "expected review.failed event")
+	assert.Equal("review.failed", failedEvent.Type)
 }
 
 func TestFailOrRetryAgent_ContextWindowErrorFailsWithoutRetry(t *testing.T) {
@@ -2279,9 +2568,7 @@ func TestCIMemberFailoverUsesSnapshottedACPBackup(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(tc.TmpDir, ".roborev.toml"),
 		fmt.Appendf(nil, "[acp.goose]\ncommand = %q\n", liveCommand), 0o644))
 	snapshot, err := json.Marshal(ciPanelMemberConfig{
-		ResolvedMember: config.ResolvedMember{
-			Agent: "test", BackupAgent: "acp.goose", BackupModel: "backup-model",
-		},
+		Agent: "test", BackupAgent: "acp.goose", BackupModel: "backup-model",
 		ACP: config.ACPAgentConfigs{"goose": {Command: frozenCommand}},
 	})
 	require.NoError(t, err)
@@ -2611,6 +2898,140 @@ func TestFailOrRetryInner_UnmatchedAgentErrorLogsWarn(t *testing.T) {
 	assert.Contains(logged, "unclassified agent error", "expected WARN line for unmatched error")
 	assert.Contains(logged, "from test:", "log line should include agent name as 'from <agent>:'")
 	assert.Contains(logged, "some brand new error wording", "log line should include error preview")
+}
+
+func TestUnavailableAgentErrorFailsWithoutRetry(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+	job := tc.createAndClaimJobWithAgent(t, "unavailable-no-backup", testWorkerID, "codex")
+	job.RepoPath = tc.TmpDir
+
+	tc.Pool.failOrRetryAgentExecutionContext(
+		context.Background(), testWorkerID, job, "codex",
+		agent.MarkUnavailable(errors.New("native package missing: platform helper absent")),
+	)
+
+	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
+	assert.True(t, strings.HasPrefix(updated.Error, review.UnavailableErrorPrefix))
+	assert.Contains(t, updated.Error, "native package missing: platform helper absent")
+	retryCount, err := tc.DB.GetJobRetryCount(job.ID)
+	require.NoError(t, err)
+	assert.Zero(t, retryCount)
+}
+
+func TestUnavailableAgentErrorFailsOverWithoutRetry(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+	cfg := config.DefaultConfig()
+	cfg.DefaultBackupAgent = "test"
+	tc.reconfigurePool(cfg)
+	job := tc.createAndClaimJobWithAgent(t, "unavailable-with-backup", testWorkerID, "codex")
+	job.RepoPath = tc.TmpDir
+
+	tc.Pool.failOrRetryAgentExecutionContext(
+		context.Background(), testWorkerID, job, "codex",
+		agent.MarkUnavailable(errors.New("native package missing")),
+	)
+
+	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusQueued)
+	assert.Equal(t, "test", updated.Agent)
+	retryCount, err := tc.DB.GetJobRetryCount(job.ID)
+	require.NoError(t, err)
+	assert.Zero(t, retryCount)
+}
+
+func TestUnavailableAgentErrorSkipsCoolingBackup(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+	cfg := config.DefaultConfig()
+	cfg.DefaultBackupAgent = "test"
+	tc.reconfigurePool(cfg)
+	tc.Pool.cooldownAgent("test", time.Now().Add(time.Hour))
+	job := tc.createAndClaimJobWithAgent(t, "unavailable-cooling-backup", testWorkerID, "codex")
+	job.RepoPath = tc.TmpDir
+
+	tc.Pool.failOrRetryAgentExecutionContext(
+		context.Background(), testWorkerID, job, "codex",
+		agent.MarkUnavailable(errors.New("native package missing")),
+	)
+
+	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
+	assert.Equal(t, "codex", updated.Agent)
+	assert.True(t, strings.HasPrefix(updated.Error, review.UnavailableErrorPrefix))
+}
+
+func TestUnavailableAgentErrorPreservesLimitClassification(t *testing.T) {
+	tests := []struct {
+		name       string
+		agentName  string
+		errorText  string
+		wantStatus storage.JobStatus
+		wantPrefix string
+		wantRetry  int
+		wantCool   bool
+	}{
+		{
+			name:       "transient",
+			agentName:  "codex",
+			errorText:  "503 Service Unavailable",
+			wantStatus: storage.JobStatusQueued,
+			wantRetry:  1,
+		},
+		{
+			name:       "quota",
+			agentName:  "codex",
+			errorText:  "you've hit your usage limit",
+			wantStatus: storage.JobStatusFailed,
+			wantPrefix: review.QuotaErrorPrefix,
+			wantCool:   true,
+		},
+		{
+			name:       "session",
+			agentName:  "claude-code",
+			errorText:  "you've hit your session limit",
+			wantStatus: storage.JobStatusFailed,
+			wantPrefix: review.OutageErrorPrefix,
+			wantCool:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tc := newWorkerTestContext(t, 1)
+			job := tc.createAndClaimJobWithAgent(t, "unavailable-"+tt.name, testWorkerID, tt.agentName)
+			job.RepoPath = tc.TmpDir
+
+			tc.Pool.failOrRetryAgentExecutionContext(
+				context.Background(), testWorkerID, job, tt.agentName,
+				agent.MarkUnavailable(errors.New(tt.errorText)),
+			)
+
+			updated := tc.assertJobStatus(t, job.ID, tt.wantStatus)
+			if tt.wantPrefix != "" {
+				assert.True(t, strings.HasPrefix(updated.Error, tt.wantPrefix))
+				assert.False(t, strings.HasPrefix(updated.Error, review.UnavailableErrorPrefix))
+			}
+			retryCount, err := tc.DB.GetJobRetryCount(job.ID)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantRetry, retryCount)
+			assert.Equal(t, tt.wantCool, tc.Pool.isAgentCoolingDown(tt.agentName))
+		})
+	}
+}
+
+func TestUnavailableAgentErrorUsesAttachedLimitClassification(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+	job := tc.createAndClaimJobWithAgent(t, "unavailable-attached-quota", testWorkerID, "codex")
+	job.RepoPath = tc.TmpDir
+
+	tc.Pool.failOrRetryAgentExecutionContext(
+		context.Background(), testWorkerID, job, "codex",
+		agent.MarkUnavailable(agent.WithLimitClassification(
+			errors.New("bounded diagnostics"),
+			agent.LimitClassification{Kind: agent.LimitKindQuota, Agent: "codex"},
+		)),
+	)
+
+	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
+	assert.True(t, strings.HasPrefix(updated.Error, review.QuotaErrorPrefix))
+	assert.True(t, tc.Pool.isAgentCoolingDown("codex"))
 }
 
 func TestFailOrRetryInner_SetsRetryNotBefore(t *testing.T) {

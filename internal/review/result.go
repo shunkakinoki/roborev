@@ -3,6 +3,7 @@
 package review
 
 import (
+	"slices"
 	"strings"
 	"unicode/utf8"
 )
@@ -35,9 +36,56 @@ const (
 	ResultSkipped = "skipped"
 )
 
+const noReviewOutputPlaceholder = "No review output generated"
+
+// HasSubstantiveOutput reports whether any completed review produced
+// agent-authored output. Failed and skipped results never qualify, even when
+// they carry diagnostic text, and neither does the placeholder returned by
+// adapters when an agent completes without output.
+func HasSubstantiveOutput(results []ReviewResult) bool {
+	return slices.ContainsFunc(results, IsSubstantiveOutput)
+}
+
+// IsSubstantiveOutput reports whether one completed review produced
+// agent-authored output.
+func IsSubstantiveOutput(result ReviewResult) bool {
+	output := strings.TrimSpace(result.Output)
+	return result.Status == ResultDone &&
+		output != "" && output != noReviewOutputPlaceholder
+}
+
 // MaxCommentLen is the maximum length for a GitHub PR comment.
 // GitHub's hard limit is ~65536; we leave headroom.
 const MaxCommentLen = 60000
+
+// CommentTruncSuffix is appended to a forge comment body when it had to
+// be cut to fit MaxCommentLen.
+const CommentTruncSuffix = "\n\n...(truncated — comment exceeded size limit)"
+
+// TruncateComment caps a forge comment body at MaxCommentLen, replacing
+// the overflow with CommentTruncSuffix and keeping the cut UTF-8 safe.
+func TruncateComment(body string) string {
+	if len(body) <= MaxCommentLen {
+		return body
+	}
+	return TrimPartialRune(body[:MaxCommentLen-len(CommentTruncSuffix)]) + CommentTruncSuffix
+}
+
+// OutputTruncSuffix marks a single review's output as cut short. It is
+// deliberately not CommentTruncSuffix: this is one section being capped inside a
+// larger body, not the comment as a whole hitting the forge's size limit.
+const OutputTruncSuffix = "\n\n...(truncated)"
+
+// TruncateOutput caps one review's output at limit, appending OutputTruncSuffix
+// and keeping the cut UTF-8 safe. limit is the budget for the output itself, so
+// the suffix sits outside it — unlike TruncateComment, where the suffix has to
+// fit inside a hard cap.
+func TruncateOutput(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	return TrimPartialRune(s[:limit]) + OutputTruncSuffix
+}
 
 // TrimPartialRune removes a trailing incomplete UTF-8 sequence that
 // may result from slicing a string at an arbitrary byte offset. Only
@@ -85,6 +133,19 @@ func OutageError(msg string) string {
 		return msg
 	}
 	return OutageErrorPrefix + msg
+}
+
+// UnavailableErrorPrefix is prepended when an agent fails before producing
+// valid protocol output and no existing quota, session, or transient category
+// applies.
+const UnavailableErrorPrefix = "unavailable: "
+
+// UnavailableError prepends UnavailableErrorPrefix unless already present.
+func UnavailableError(msg string) string {
+	if strings.HasPrefix(msg, UnavailableErrorPrefix) {
+		return msg
+	}
+	return UnavailableErrorPrefix + msg
 }
 
 // TimeoutErrorPrefix is prepended to error messages when a batch job

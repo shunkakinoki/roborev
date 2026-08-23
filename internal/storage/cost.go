@@ -32,7 +32,8 @@ type CostOptions struct {
 // them would report $0 spend at full coverage while real money went unrecorded.
 // json_extract yields NULL for both an absent key and an explicit null, while a
 // genuine free run stores 0 and still counts.
-const hasCost = "json_valid(j.token_usage) AND json_extract(j.token_usage, '$.has_cost') " +
+const hasCost = "json_valid(j.token_usage) AND " +
+	"COALESCE(json_extract(j.token_usage, '$.has_cost'), 0) " +
 	"AND json_extract(j.token_usage, '$.cost_usd') IS NOT NULL"
 
 // agentRanByUsage is the fallback agent-ran signal: a token_usage blob that
@@ -58,9 +59,13 @@ const agentRanByUsage = "json_valid(j.token_usage) AND (" +
 // covers rows predating the marker. Terminal rows that never run an agent (panel
 // synthesis passthrough/all-failed/all-passed, or a job that failed a pre-agent
 // gate) carry neither signal and stay out of the denominator, so coverage is not
-// dragged below 100% by rows that could never report cost.
-const costEligible = "j.started_at IS NOT NULL AND j.finished_at IS NOT NULL " +
-	"AND j.status != 'skipped' AND (j.agent_invoked = 1 OR (" + agentRanByUsage + "))"
+// dragged below 100% by rows that could never report cost. Invoked classifier
+// attempts remain eligible when their terminal review row is marked skipped.
+const costTerminal = "j.started_at IS NOT NULL AND j.finished_at IS NOT NULL " +
+	"AND j.status IN ('done','applied','rebased','failed','canceled','skipped')"
+
+const costEligible = costTerminal + " " +
+	"AND (j.agent_invoked = 1 OR (" + agentRanByUsage + "))"
 
 // GetCostAggregate computes approximate agent spend for the given scope on a
 // fresh read.
